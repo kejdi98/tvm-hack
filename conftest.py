@@ -16,10 +16,14 @@
 # under the License.
 import hashlib
 import pytest
+import sys
 import os
-from collections import OrderedDict
+
+from pathlib import Path
 
 pytest_plugins = ["tvm.testing.plugin"]
+IS_IN_CI = os.getenv("CI", "") == "true"
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 # These are long running tests (manually curated and extracted from CI logs)
@@ -54,13 +58,13 @@ for idx, test in enumerate(_slowest_tests):
 
 # These rely on running on the same node to pass successfully
 FIXED_ALLOCATION_PREFIXES = {
-    "tests/python/unittest/test_tvm_testing_features.py": 0,
+    "tests/python/testing/test_tvm_testing_features.py": 0,
 }
 
 
-def should_run(nodeid: str, num_shards: int, shard_index: int) -> bool:
+def find_shard_index(nodeid: str, num_shards: int) -> int:
     """
-    Return true if this test should run on this shard
+    Return the index of the shard that should run this test
     """
     for prefix, target_shard_idx in FIXED_ALLOCATION_PREFIXES.items():
         if nodeid.startswith(prefix):
@@ -68,7 +72,7 @@ def should_run(nodeid: str, num_shards: int, shard_index: int) -> bool:
                 raise RuntimeError(
                     f"Cannot collect sharded tests, {nodeid} has hardcoded shard index {target_shard_idx} among only {num_shards} shards"
                 )
-            return target_shard_idx == shard_index
+            return target_shard_idx
 
     if nodeid in HARDCODED_ALLOCATIONS:
         hash = HARDCODED_ALLOCATIONS[nodeid]
@@ -76,7 +80,7 @@ def should_run(nodeid: str, num_shards: int, shard_index: int) -> bool:
         hash = hashlib.md5(nodeid.encode())
         hash = int(hash.hexdigest(), 16)
 
-    return hash % num_shards == shard_index
+    return hash % num_shards
 
 
 def pytest_collection_modifyitems(config, items):
@@ -88,6 +92,17 @@ def pytest_collection_modifyitems(config, items):
     shard_index = int(os.environ["TVM_SHARD_INDEX"])
 
     print(f"Marking tests for shard {shard_index} of {num_shards}")
-    for item in items:
-        if not should_run(item.nodeid, num_shards=num_shards, shard_index=shard_index):
-            item.add_marker(pytest.mark.skip())
+    items_copy = list(items)
+    for item in items_copy:
+        item_shard_index = find_shard_index(item.nodeid, num_shards=num_shards)
+        if item_shard_index != shard_index:
+            items.remove(item)
+
+
+def pytest_sessionstart():
+    if IS_IN_CI:
+        hook_script_dir = REPO_ROOT / "tests" / "scripts" / "request_hook"
+        sys.path.append(str(hook_script_dir))
+        import request_hook  # pylint: disable=import-outside-toplevel
+
+        request_hook.init()

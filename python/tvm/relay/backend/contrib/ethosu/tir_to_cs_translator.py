@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=use-list-literal, invalid-name
 """This source will contain code to convert TIR, as produced by
 the Relay to TIR compilation process, to Vela API calls to
 generate command stream.
@@ -29,6 +30,7 @@ from tvm.tir import stmt_functor
 from tvm.relay.backend.contrib.ethosu import util
 from tvm.relay.backend.contrib.ethosu import vela_api
 from tvm.relay.backend.contrib.ethosu.tir import spec
+from tvm.relay.backend.contrib.ethosu.tir import utils as tir_utils
 
 
 class BufferType(Enum):
@@ -254,26 +256,40 @@ def extract_param_base_addresses(mod, buffer_info, scratch_region_map) -> List[u
     assert len(mod.functions.items()) == 1
     primfunc = mod.functions.items()[0][1]
 
+    buffer_map = tir_utils.collect_buffer_map(primfunc.body)
+
     base_addresses = list()
     idx = 0
+
     for param in primfunc.params:
         # constants are pooled together and handled specially
         # this will change after tir.allocate_const.
         # For now, we are skipping generating buffer addresses here
         if buffer_info[param].btype == BufferType.constant:
             continue
-        buffer = primfunc.buffer_map[param]
-        dtype = buffer.dtype
-        element_size_bytes = np.iinfo(dtype).bits // 8
-        size_bytes = element_size_bytes * np.prod(list(buffer.shape))
-        base_addresses.append(
-            util.BaseAddress(
-                param.name,
-                idx,
-                _get_region(buffer_info[param].btype, param, scratch_region_map),
-                size_bytes,
+
+        if param in buffer_map:
+            buffer = buffer_map[param]
+            dtype = buffer.dtype
+            element_size_bytes = np.iinfo(dtype).bits // 8
+            size_bytes = element_size_bytes * np.prod(list(buffer.shape))
+            base_addresses.append(
+                util.BaseAddress(
+                    param.name.replace("-", "_"),
+                    idx,
+                    _get_region(buffer_info[param].btype, param, scratch_region_map),
+                    size_bytes,
+                )
             )
-        )
+        else:
+            base_addresses.append(
+                util.BaseAddress(
+                    param.name.replace("-", "_"),
+                    idx,
+                    _get_region(buffer_info[param].btype, param, scratch_region_map),
+                    0,
+                )
+            )
         idx += 1
 
     return base_addresses
@@ -388,7 +404,6 @@ def assign_addresses(buffer_info, npu_ops, scratch_region_map):
         The key is the buffer name to BufferInfo
     npu_ops : list
         A list of Vela NpuOps with tir.BufferLoads for addresses
-        A list of Vela NpuOps with tir.Loads for addresses
     scratch_region_map : Dict[tvm.tir.Var, RegionOffset]
         A buffer_var to region and offset map.
     Returns
@@ -401,11 +416,6 @@ def assign_addresses(buffer_info, npu_ops, scratch_region_map):
 
     def replace_npu_fm_with_address(npu_fm):
         assert isinstance(npu_fm.tiles.addresses[0], tvm.tir.BufferLoad)
-        # We currently does not support tiles
-        # Change this when tiles are needed
-        # (i.e. when using rolling buffers)
-        assert npu_fm.tiles.addresses[1:] == [0, 0, 0]
-        npu_fm.tiles.addresses[1:] = [0, 0, 0]
         buffer = npu_fm.tiles.addresses[0].buffer.data
         if buffer in scratch_region_map.keys():
             address = scratch_region_map[buffer].offset
@@ -421,6 +431,13 @@ def assign_addresses(buffer_info, npu_ops, scratch_region_map):
             np.iinfo(np.dtype(npu_fm.tiles.addresses[0])).bits // 8
         )
         npu_fm.tiles.addresses[0] = address + int(index)
+        npu_fm.tiles.addresses[1] = (
+            address if isinstance(npu_fm.tiles.addresses[1], tvm.tir.BufferLoad) else 0
+        )
+        npu_fm.tiles.addresses[2] = (
+            address if isinstance(npu_fm.tiles.addresses[2], tvm.tir.BufferLoad) else 0
+        )
+        npu_fm.tiles.addresses[3] = 0
         npu_fm.region = region
         return npu_fm
 
@@ -439,6 +456,7 @@ def assign_addresses(buffer_info, npu_ops, scratch_region_map):
             )
         assert buffer in buffer_addresses.keys(), f"searching for buffer : {buffer}, but not found"
         address, buffer_type = buffer_addresses[buffer]
+        address = address + int(npu_addr_range.address.indices[0].value)
         return vapi.NpuAddressRange(_get_region(buffer_type), address, npu_addr_range.length)
 
     def replace_tir_loads(npu_object):
@@ -565,12 +583,16 @@ def _convert_clip_bounds(npu_op: vapi.NpuBlockOperation):
     """
     clip_min_quant = npu_op.activation.min
     clip_max_quant = npu_op.activation.max
-    clip_min_actual = (
-        clip_min_quant - npu_op.ofm.quantization.zero_point
-    ) * npu_op.ofm.quantization.scale_f32
-    clip_max_actual = (
-        clip_max_quant - npu_op.ofm.quantization.zero_point
-    ) * npu_op.ofm.quantization.scale_f32
+    if npu_op.ofm.quantization.scale_f32:
+        clip_min_actual = (
+            clip_min_quant - npu_op.ofm.quantization.zero_point
+        ) * npu_op.ofm.quantization.scale_f32
+        clip_max_actual = (
+            clip_max_quant - npu_op.ofm.quantization.zero_point
+        ) * npu_op.ofm.quantization.scale_f32
+    else:
+        clip_min_actual = clip_min_quant
+        clip_max_actual = clip_max_quant
     npu_op.activation.min = clip_min_actual
     npu_op.activation.max = clip_max_actual
 
@@ -604,13 +626,30 @@ def _create_npu_op_conv2d(
     """This is a helper function to capture a list
     of arguments to create Vela NpuConv2DOperation object.
     """
+    has_two_weights = serial_2d_convolution.weight2.address != -1
+    has_two_biases = serial_2d_convolution.scale_bias2.address != -1
+
     npu_conv2d_op = vapi.NpuConv2DOperation()
     npu_conv2d_op.ifm = _create_npu_feature_map(serial_2d_convolution.ifm)
     npu_conv2d_op.ofm = _create_npu_feature_map(serial_2d_convolution.ofm)
     npu_conv2d_op.kernel = _create_npu_kernel(serial_2d_convolution.kernel)
-    npu_conv2d_op.weights = [_create_npu_address_range(serial_2d_convolution.weight)]
+    npu_conv2d_op.weights = (
+        [
+            _create_npu_address_range(serial_2d_convolution.weight),
+            _create_npu_address_range(serial_2d_convolution.weight2),
+        ]
+        if has_two_weights
+        else [_create_npu_address_range(serial_2d_convolution.weight)]
+    )
     weights_zero_point = np.int64(serial_2d_convolution.weight_zero_point.value)
-    npu_conv2d_op.biases = [_create_npu_address_range(serial_2d_convolution.scale_bias)]
+    npu_conv2d_op.biases = (
+        [
+            _create_npu_address_range(serial_2d_convolution.scale_bias),
+            _create_npu_address_range(serial_2d_convolution.scale_bias2),
+        ]
+        if has_two_biases
+        else [_create_npu_address_range(serial_2d_convolution.scale_bias)]
+    )
     npu_conv2d_op.padding = _create_npu_padding(serial_2d_convolution.padding)
 
     npu_conv2d_op.activation = _create_npu_activation(serial_2d_convolution.activation)
@@ -787,7 +826,10 @@ def _create_npu_quantization(
     """This is a helper function to capture a list
     of arguments to create Vela NpuQuantization object.
     """
-    return vapi.NpuQuantization(scale_f32=float(scale), zero_point=int(zero_point))
+    scale = float(scale)
+    if scale == 0.0:
+        scale = None
+    return vapi.NpuQuantization(scale_f32=scale, zero_point=int(zero_point))
 
 
 def _create_npu_weights_zero_point(
@@ -884,17 +926,20 @@ def _create_npu_dma_op(serial_copy):
     """This is a helper function to capture the list of arguments
     to create a NpuDmaOperation object"""
     data_type_bytes = np.iinfo(np.dtype(serial_copy.read_address.dtype)).bits // 8
+    length = int(serial_copy.length.value) * data_type_bytes
+    # The buffer size in bytes must be at least 16 bytes
+    length = max(length, 16)
     src = vapi.NpuAddressRange(
         # region will be updated later
         region=0,
         address=serial_copy.read_address,
-        length=int(serial_copy.length.value) * data_type_bytes,
+        length=length,
     )
     dest = vapi.NpuAddressRange(
         # region will be updated later
         region=0,
         address=serial_copy.write_address,
-        length=int(serial_copy.length.value) * data_type_bytes,
+        length=length,
     )
     return vapi.NpuDmaOperation(src, dest)
 
@@ -925,6 +970,8 @@ def _create_npu_op_pooling(serial_pooling: spec.SerialPooling):
         npu_pooling_op = vapi.NpuPoolingOp.AVERAGE
     elif pooling_type == "MAX":
         npu_pooling_op = vapi.NpuPoolingOp.MAX
+    elif pooling_type == "SUM":
+        npu_pooling_op = vapi.NpuPoolingOp.REDUCE_SUM
 
     npu_pooling_op = vapi.NpuPoolingOperation(npu_pooling_op)
     npu_pooling_op.ifm = _create_npu_feature_map(serial_pooling.ifm)
@@ -997,6 +1044,11 @@ def _create_npu_op_binary_elementwise(serial_binary_elementwise: spec.SerialBina
     npu_binary_elementwise_op.ifm2 = _create_npu_feature_map(serial_binary_elementwise.ifm2)
     npu_binary_elementwise_op.ofm = _create_npu_feature_map(serial_binary_elementwise.ofm)
     npu_binary_elementwise_op.reversed_operands = serial_binary_elementwise.reversed_operands
+    if serial_binary_elementwise.rescale_config.use_rescale:
+        npu_binary_elementwise_op.rescale = (
+            serial_binary_elementwise.rescale_config.scale.value,
+            serial_binary_elementwise.rescale_config.shift.value,
+        )
 
     npu_binary_elementwise_op.activation = _create_npu_activation(
         serial_binary_elementwise.activation
@@ -1027,7 +1079,6 @@ def _create_npu_op_binary_elementwise(serial_binary_elementwise: spec.SerialBina
 def translate_ethosu_unary_elementwise(
     tir_extern_call: tvm.tir.Call,
 ) -> vapi.NpuElementWiseOperation:
-
     """This function will translate a tir extern_call
     as produced by Relay to TIR compilation.
     Parameters

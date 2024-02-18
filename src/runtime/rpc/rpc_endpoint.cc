@@ -40,6 +40,7 @@
 
 #include "../../support/arena.h"
 #include "../../support/ring_buffer.h"
+#include "../../support/utils.h"
 #include "../object_internal.h"
 #include "rpc_local_session.h"
 
@@ -174,8 +175,11 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
     for (int i = 0; i < num_args; ++i) {
       int tcode = type_codes[i];
       if (tcode == kTVMObjectHandle || tcode == kTVMObjectRValueRefArg) {
-        LOG(FATAL) << "ValueError: Cannot pass argument " << i << ", type "
-                   << args[i].AsObjectRef<ObjectRef>()->GetTypeKey() << " is not supported by RPC";
+        if (!args[i].IsObjectRef<RPCObjectRef>()) {
+          LOG(FATAL) << "ValueError: Cannot pass argument " << i << ", type "
+                     << args[i].AsObjectRef<ObjectRef>()->GetTypeKey()
+                     << " is not supported by RPC";
+        }
       } else if (tcode == kDLDevice) {
         DLDevice dev = args[i];
         ICHECK(!IsRPCSessionDevice(dev)) << "InternalError: cannot pass RPC device in the channel";
@@ -216,6 +220,50 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
   void Write(RPCCode code) {
     int32_t cdata = static_cast<int>(code);
     this->Write(cdata);
+  }
+
+  void WriteObject(Object* obj) {
+    // NOTE: for now all remote object are encoded as RPCObjectRef
+    // follow the same disco protocol in case we would like to upgrade later
+    //
+    // Rationale note: Only handle remote object allows the same mechanism to work for minRPC
+    // which is needed for wasm and other env that goes through C API
+    if (obj->IsInstance<RPCObjectRefObj>()) {
+      auto* ref = static_cast<RPCObjectRefObj*>(obj);
+      this->template Write<uint32_t>(kRuntimeRPCObjectRefTypeIndex);
+      uint64_t handle = reinterpret_cast<uint64_t>(ref->object_handle());
+      this->template Write<int64_t>(handle);
+    } else {
+      LOG(FATAL) << "ValueError: Object type is not supported in RPC calling convention: "
+                 << obj->GetTypeKey() << " (type_index = " << obj->type_index() << ")";
+    }
+  }
+  uint64_t GetObjectBytes(Object* obj) {
+    if (obj->IsInstance<RPCObjectRefObj>()) {
+      return sizeof(uint32_t) + sizeof(int64_t);
+    } else {
+      LOG(FATAL) << "ValueError: Object type is not supported in RPC calling convention: "
+                 << obj->GetTypeKey() << " (type_index = " << obj->type_index() << ")";
+    }
+  }
+
+  void ReadObject(int* tcode, TVMValue* value) {
+    // NOTE: for now all remote object are encoded as RPCObjectRef
+    // follow the same disco protocol in case we would like to upgrade later
+    //
+    // Rationale note: Only handle remote object allows the same mechanism to work for minRPC
+    // which is needed for wasm and other env that goes through C API
+    uint32_t type_index;
+    this->template Read<uint32_t>(&type_index);
+    if (type_index == kRuntimeRPCObjectRefTypeIndex) {
+      uint64_t handle;
+      this->template Read<uint64_t>(&handle);
+      tcode[0] = kTVMObjectHandle;
+      value[0].v_handle = reinterpret_cast<void*>(handle);
+    } else {
+      LOG(FATAL) << "ValueError: Object type is not supported in Disco calling convention: "
+                 << Object::TypeIndex2Key(type_index) << " (type_index = " << type_index << ")";
+    }
   }
 
   void MessageDone() {
@@ -372,8 +420,11 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
     if (code == RPCCode::kException) {
       // switch to the state before sending exception.
       this->SwitchToState(kRecvPacketNumBytes);
-      std::string msg = args[0];
-      LOG(FATAL) << "RPCError: Error caught from RPC call:\n" << msg;
+      String msg = args[0];
+      if (!support::StartsWith(msg, "RPCSessionTimeoutError: ")) {
+        msg = "RPCError: Error caught from RPC call:\n" + msg;
+      }
+      LOG(FATAL) << msg;
     }
 
     ICHECK(setreturn != nullptr) << "fsetreturn not available";
@@ -623,6 +674,9 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
 
 RPCCode RPCEndpoint::HandleUntilReturnEvent(bool client_mode, RPCSession::FEncodeReturn setreturn) {
   RPCCode code = RPCCode::kCallFunc;
+
+  CHECK(channel_) << "Expected connection to server " << name_
+                  << " to be active, but the connection was previously closed";
   while (code != RPCCode::kReturn && code != RPCCode::kShutdown && code != RPCCode::kCopyAck) {
     while (writer_.bytes_available() != 0) {
       writer_.ReadWithCallback(
@@ -1125,6 +1179,8 @@ class RPCClientSession : public RPCSession, public DeviceAPI {
   DeviceAPI* GetDeviceAPI(Device dev, bool allow_missing) final { return this; }
 
   bool IsLocalSession() const final { return false; }
+
+  void Shutdown() final { endpoint_->Shutdown(); }
 
  private:
   uint64_t GetRPCMaxTransferSize() {

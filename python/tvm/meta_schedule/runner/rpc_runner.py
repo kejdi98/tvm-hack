@@ -16,7 +16,6 @@
 # under the License.
 """RPC Runner"""
 import concurrent.futures
-import logging
 import os.path as osp
 from contextlib import contextmanager
 from typing import Callable, List, Optional, Union
@@ -25,6 +24,8 @@ from tvm.contrib.popen_pool import PopenPoolExecutor
 from tvm.rpc import RPCSession
 from tvm.runtime import Device, Module
 
+from ..logging import get_logger
+from ..profiler import Profiler
 from ..utils import (
     derived_object,
     get_global_func_on_rpc_session,
@@ -39,7 +40,7 @@ from .utils import (
     run_evaluator_common,
 )
 
-logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 
 T_CREATE_SESSION = Callable[  # pylint: disable=invalid-name
@@ -242,7 +243,7 @@ class RPCRunner(PyRunner):
         f_alloc_argument: Union[T_ALLOC_ARGUMENT, str, None] = None,
         f_run_evaluator: Union[T_RUN_EVALUATOR, str, None] = None,
         f_cleanup: Union[T_CLEANUP, str, None] = None,
-        max_workers: int = 1,
+        max_workers: Optional[int] = None,
         initializer: Optional[Callable[[], None]] = None,
     ) -> None:
         """Constructor
@@ -267,7 +268,7 @@ class RPCRunner(PyRunner):
             The function name to run the evaluator or the function itself.
         f_cleanup: Union[T_CLEANUP, str, None]
             The function name to cleanup the session or the function itself.
-        max_workers: int = 1
+        max_workers: Optional[int] = None
             The maximum number of connections. Defaults to 1.
         initializer: Optional[Callable[[], None]]
             The initializer function.
@@ -282,10 +283,11 @@ class RPCRunner(PyRunner):
         self.f_alloc_argument = f_alloc_argument
         self.f_run_evaluator = f_run_evaluator
         self.f_cleanup = f_cleanup
+        if max_workers is None:
+            max_workers = 1
         logger.info("RPCRunner: max_workers = %d", max_workers)
         self.pool = PopenPoolExecutor(
             max_workers=max_workers,
-            timeout=rpc_config.session_timeout_sec,
             initializer=initializer,
         )
         self._sanity_check()
@@ -375,31 +377,36 @@ def _worker_func(
             yield
         finally:
             # Final step. Always clean up
-            f_cleanup(session, remote_path)
+            with Profiler.timeit("RPCRunner/cleanup"):
+                f_cleanup(session, remote_path)
 
     with resource_handler():
         # Step 1. Create session
-        session = f_create_session(rpc_config)
-        device = session.device(dev_type=device_type, dev_id=0)
+        with Profiler.timeit("RPCRunner/create_session"):
+            session = f_create_session(rpc_config)
+            device = session.device(dev_type=device_type, dev_id=0)
         # Step 2. Upload the module
-        _, remote_path = osp.split(artifact_path)
-        local_path: str = artifact_path
-        rt_mod: Module = f_upload_module(session, local_path, remote_path)
+        with Profiler.timeit("RPCRunner/upload_module"):
+            _, remote_path = osp.split(artifact_path)
+            local_path: str = artifact_path
+            rt_mod: Module = f_upload_module(session, local_path, remote_path)
         # Step 3: Allocate input arguments
-        repeated_args: List[T_ARGUMENT_LIST] = f_alloc_argument(
-            session,
-            device,
-            args_info,
-            alloc_repeat,
-        )
+        with Profiler.timeit("RPCRunner/alloc_argument"):
+            repeated_args: List[T_ARGUMENT_LIST] = f_alloc_argument(
+                session,
+                device,
+                args_info,
+                alloc_repeat,
+            )
         # Step 4: Run time_evaluator
-        costs: List[float] = f_run_evaluator(
-            session,
-            rt_mod,
-            device,
-            evaluator_config,
-            repeated_args,
-        )
+        with Profiler.timeit("LocalRunner/run_evaluator"):
+            costs: List[float] = f_run_evaluator(
+                session,
+                rt_mod,
+                device,
+                evaluator_config,
+                repeated_args,
+            )
     return costs
 
 
@@ -471,7 +478,7 @@ def default_alloc_argument(
     """
     f_random_fill = get_global_func_on_rpc_session(
         session,
-        "tvm.contrib.random.random_fill",
+        "tvm.contrib.random.random_fill_for_measure",
         "Please make sure 'USE_RANDOM' is turned ON in the config.cmake on the RPC server.",
     )
 

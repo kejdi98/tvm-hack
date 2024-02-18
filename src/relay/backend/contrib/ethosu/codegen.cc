@@ -24,9 +24,9 @@
  * Codegen.
  */
 
-#include <tvm/ir/error.h>
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/attrs/annotation.h>
+#include <tvm/relay/error.h>
 #include <tvm/relay/expr.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
@@ -47,6 +47,8 @@ namespace relay {
 namespace contrib {
 namespace ethosu {
 
+using FTVMTIRToRuntime = tvm::runtime::TypedPackedFunc<runtime::Module(IRModule, Target)>;
+
 /*!
  * \brief This mutator outlines functions that are marked with a named
  * "Compiler" attribute. Functions that do not match this condition remain
@@ -57,28 +59,81 @@ class OutlineCompilerFunctionsMutator : public MixedModeMutator {
   explicit OutlineCompilerFunctionsMutator(const IRModule& mod, const std::string& compiler_name)
       : mod_(mod), compiler_name_(compiler_name) {}
 
+  Expr VisitExpr_(const LetNode* op) final {
+    auto pre_visit = [this](const LetNode* op) {
+      Expr var = this->VisitExpr(op->var);
+      Expr value = this->VisitExpr(op->value);
+
+      // Outlineable function no longer needs let binding
+      if (this->CanOutlineExpr(value)) {
+        this->memo_[var] = value;
+      }
+    };
+    auto post_visit = [this](const LetNode* op) {
+      // Rely on the Memoizer to cache pre-visit values
+      Expr value = this->VisitExpr(op->value);
+      Expr body = this->VisitExpr(op->body);
+      auto expr = GetRef<Expr>(op);
+
+      // Drop the let binding
+      if (this->CanOutlineExpr(value)) {
+        this->memo_[expr] = this->VisitExpr(op->body);
+      } else {
+        Var var = Downcast<Var>(this->VisitExpr(op->var));
+        if (var.same_as(op->var) && value.same_as(op->value) && body.same_as(op->body)) {
+          this->memo_[expr] = expr;
+        } else {
+          this->memo_[expr] = Let(var, value, body);
+        }
+      }
+    };
+    ExpandANormalForm(op, pre_visit, post_visit);
+    return memo_[GetRef<Expr>(op)];
+  }
+
   Expr Rewrite_(const CallNode* pre, const Expr& post) override {
     Call call = Downcast<Call>(post);
-    if (call->op->IsInstance<FunctionNode>()) {
+    if (CanOutlineExpr(call->op)) {
       Function func = Downcast<Function>(call->op);
-      auto compiler = func->GetAttr<String>(attr::kCompiler);
-      if (compiler.defined() && compiler == compiler_name_) {
-        auto gv_name = func->GetAttr<String>("global_symbol").value_or("");
-        ICHECK_NE(gv_name, "")
-            << "Function to be outlined must have global_symbol attribute, but didn't.";
-        GlobalVar gv(gv_name);
-        if (func->checked_type_.defined()) {
-          gv->checked_type_ = func->checked_type();
-        }
-        mod_->Update(gv, func);
-        return Call(gv, call->args, call->attrs, call->type_args);
+      auto gv_name = func->GetAttr<String>("global_symbol").value_or("");
+      ICHECK_NE(gv_name, "")
+          << "Function to be outlined must have global_symbol attribute, but didn't.";
+      GlobalVar gv(gv_name);
+      if (func->checked_type_.defined()) {
+        gv->checked_type_ = func->checked_type();
       }
+      mod_->Update(gv, func);
+      return Call(gv, call->args, call->attrs, call->type_args);
     }
     return post;
   }
 
  private:
+  /*!
+   * \brief Check if the expr is a function and has the same
+   * compiler name as compiler_name_.
+   *
+   * \param expr The input expr.
+   * \return True if is outlineable else False.
+   */
+  bool CanOutlineExpr(const Expr& expr) {
+    if (!expr->IsInstance<FunctionNode>()) {
+      return false;
+    }
+    Function func = Downcast<Function>(expr);
+    auto compiler = func->GetAttr<String>(attr::kCompiler);
+    if (!compiler.defined()) {
+      return false;
+    }
+    if (compiler != compiler_name_) {
+      return false;
+    }
+    return true;
+  }
+
+  /*! \brief The module that the pass will run on. */
   IRModule mod_;
+  /*! \brief The name of the compiler to enable outlining on external functions for. */
   std::string compiler_name_;
 };
 
@@ -138,7 +193,7 @@ class RemoveRedundantIdentities : public MixedModeMutator {
       }
 
       if (const auto* parent_callnode = current_arg.as<CallNode>()) {
-        if (const auto* parent_op = parent_callnode->op.as<OpNode>()) {
+        if (auto parent_op = parent_callnode->op.as<OpNode>()) {
           Call parent_call = GetRef<Call>(parent_callnode);
           if (parent_op->name == "contrib.ethosu.identity" && IdentityDoesNothing(parent_call) &&
               CheckIdentityBetweenTransformOperations(call, parent_call)) {
@@ -188,7 +243,7 @@ class RemoveRedundantIdentities : public MixedModeMutator {
 
       const auto* call_tt = call->checked_type_.as<TensorTypeNode>();
       const auto* identity_arg_tt = identity_arg->checked_type_.as<TensorTypeNode>();
-      CHECK(call_tt && identity_arg_tt)
+      ICHECK(call_tt && identity_arg_tt)
           << "InferType should be run before RemoveRedundantIdentities";
 
       // we can only remove the identity operation if the second non-compute operation
@@ -267,7 +322,7 @@ runtime::Module TIRToRuntime(IRModule mod, Target target) {
 
 TVM_REGISTER_TARGET_KIND("ethos-u", kDLCPU)
     .set_attr<Bool>("use_device_api", Bool(true))
-    .set_attr<FTVMRelayToTIR>("RelayToTIR", RelayToTIR())
+    .set_attr<relay::transform::FTVMRelayToTIR>(tvm::attr::kRelayToTIR, RelayToTIR())
     .set_attr<FTVMTIRToRuntime>("TIRToRuntime", TIRToRuntime);
 
 }  // namespace ethosu

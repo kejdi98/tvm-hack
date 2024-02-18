@@ -28,7 +28,6 @@ from typing import List
 import os
 import struct
 import numpy as np
-import tflite.Model
 import math
 from enum import IntEnum
 import tensorflow as tf
@@ -45,9 +44,10 @@ from tvm.relay.expr_functor import ExprMutator
 from tvm.relay.op.annotation import compiler_begin, compiler_end
 from tvm.relay.backend.contrib.ethosu import preprocess
 import tvm.relay.testing.tf as tf_testing
+from tvm import WorkspaceMemoryPools, WorkspacePoolInfo, PoolInfoProperties
 
 from tvm.relay.op.contrib.ethosu import partition_for_ethosu
-from tests.python.relay.aot.aot_test_utils import (
+from tvm.testing.aot import (
     AOTCompiledTestModel,
     AOTDataLinkage,
     AOTTestModel,
@@ -109,23 +109,55 @@ def deserialize_command_stream(blob):
     return cmms
 
 
-def create_test_runner(accel="ethos-u55-256", enable_usmp=True):
+def _get_workspace_size_define_macro(pool_name: str, model_name="default") -> str:
+    """This function converts pool names to compiler generated
+    workspace pool size macros"""
+
+    prefix = "TVMGEN_" + model_name.upper() + "_"
+    postfix = "_WORKSPACE_POOL_SIZE"
+    return prefix + pool_name.upper() + postfix
+
+
+def create_test_runner(
+    accel="ethos-u55-256",
+    enable_usmp=True,
+    enable_cascader=False,
+    enable_striping=False,
+    workspace_pools=None,
+):
+
     file_dir = os.path.dirname(os.path.abspath(__file__))
     test_root = os.path.join(file_dir, "reference_system")
     _, ethosu_variant, ethosu_macs = accel.split("-")
     ethosu_variant = ethosu_variant.upper()
+
+    prologue = """
+    UartStdOutInit();
+    EthosuInit();
+
+    struct ethosu_driver* ethos_u = ethosu_reserve_driver();
+    """
+
+    if workspace_pools:
+        for pool in workspace_pools.pools:
+            prologue = (
+                prologue
+                + f"""
+    #ifdef {_get_workspace_size_define_macro(pool.pool_name)}
+    __attribute__((section(".bss.noinit.tvm"), aligned(16)))
+    static uint8_t {pool.pool_name}[{_get_workspace_size_define_macro(pool.pool_name)}];
+    #endif
+
+            """
+            )
+
     return AOTTestRunner(
         makefile="corstone300",
-        prologue="""
-        uart_init();
-        EthosuInit();
-
-        struct ethosu_driver* ethos_u = ethosu_reserve_driver();
-        """,
+        prologue=prologue,
         epilogue="""
         ethosu_release_driver(ethos_u);
         """,
-        includes=["uart.h", "ethosu_55.h", "ethosu_mod.h", "hard_fault.h"],
+        includes=["uart_stdout.h", "ethosu_55.h", "ethosu_mod.h", "hard_fault.h"],
         parameters={
             "ETHOSU_TEST_ROOT": test_root,
             "NPU_MACS": ethosu_macs,
@@ -134,6 +166,8 @@ def create_test_runner(accel="ethos-u55-256", enable_usmp=True):
         pass_config={
             "relay.ext.ethos-u.options": {
                 "accelerator_config": accel,
+                "enable_cascader": enable_cascader,
+                "enable_striping": enable_striping,
             },
             "tir.usmp.enable": enable_usmp,
             "tir.usmp.algorithm": "hill_climb",
@@ -143,9 +177,13 @@ def create_test_runner(accel="ethos-u55-256", enable_usmp=True):
 
 
 def build_source(
-    module, inputs, outputs, accel="ethos-u55-256", output_tolerance=0, enable_usmp=True
+    module,
+    inputs,
+    outputs,
+    test_runner,
+    output_tolerance=0,
+    workspace_pools=None,
 ):
-    test_runner = create_test_runner(accel, enable_usmp)
     return compile_models(
         models=AOTTestModel(
             module=module,
@@ -156,21 +194,17 @@ def build_source(
         ),
         interface_api="c",
         use_unpacked_api=True,
+        workspace_memory_pools=workspace_pools,
         workspace_byte_alignment=16,
         pass_config=test_runner.pass_config,
     )
 
 
-def verify_source(
-    models: List[AOTCompiledTestModel],
-    accel="ethos-u55-256",
-    enable_usmp=True,
-):
+def verify_source(models: List[AOTCompiledTestModel], test_runner):
     """
     This method verifies the generated source from an NPU module by building it and running on an FVP.
     """
     interface_api = "c"
-    test_runner = create_test_runner(accel, enable_usmp)
     run_and_check(
         models,
         test_runner,
@@ -276,7 +310,15 @@ def get_tflite_graph(tf_func, shapes, ranges=None):
     converter.inference_output_type = tf.int8
     tflite_graph = converter.convert()
 
-    tflite_model = tflite.Model.Model.GetRootAsModel(tflite_graph, 0)
+    # Get TFLite model from buffer
+    try:
+        import tflite
+
+        tflite_model = tflite.Model.GetRootAsModel(tflite_graph, 0)
+    except AttributeError:
+        import tflite.Model
+
+        tflite_model = tflite.Model.Model.GetRootAsModel(tflite_graph, 0)
 
     relay_module, params = relay.frontend.from_tflite(tflite_model)
     mod = partition_for_ethosu(relay_module, params)
@@ -284,13 +326,46 @@ def get_tflite_graph(tf_func, shapes, ranges=None):
 
 
 def compare_ethosu_with_reference(
-    mod, input_data, output_data, accel_type, output_tolerance=0, print_cmm=False
+    mod,
+    input_data,
+    output_data,
+    accel_type: str,
+    output_tolerance=0,
+    print_cmm=False,
+    enable_cascader=None,
 ):
+    if enable_cascader is None:
+        enable_cascader = "u65" not in accel_type
+    pool_name = "my_memory_pool"
+    host_target = tvm.target.Target("c")
+    ethosu_target = tvm.target.Target("ethos-u")
+    workspace_pools = WorkspaceMemoryPools(
+        [
+            WorkspacePoolInfo(
+                pool_name,
+                [host_target, ethosu_target],
+                PoolInfoProperties(
+                    size_hint_bytes=2400000,
+                    read_bandwidth_bytes_per_cycle=16,
+                    write_bandwidth_bytes_per_cycle=16,
+                    target_burst_bytes={ethosu_target: 1},
+                ),
+            )
+        ]
+    )
+    test_runner = create_test_runner(
+        accel_type,
+        enable_usmp=True,
+        enable_cascader=enable_cascader,
+        enable_striping=False,
+        workspace_pools=workspace_pools,
+    )
     compiled_models = build_source(
         mod,
         input_data,
         output_data,
-        accel_type,
+        test_runner,
+        workspace_pools=workspace_pools,
         output_tolerance=output_tolerance,
     )
 
@@ -304,11 +379,17 @@ def compare_ethosu_with_reference(
         cmms = bytes.fromhex(compilation_artifacts[0].command_stream)
         print_payload(cmms)
 
-    verify_source(compiled_models, accel_type)
+    verify_source(compiled_models, test_runner)
 
 
 def compare_tvm_with_tflite(
-    tf_func, shapes, accel_type, ranges=None, output_tolerance=0, print_cmm=False
+    tf_func,
+    shapes,
+    accel_type,
+    ranges=None,
+    output_tolerance=0,
+    print_cmm=False,
+    enable_cascader=None,
 ):
     mod, tflite_graph = get_tflite_graph(tf_func, shapes, ranges)
 
@@ -322,6 +403,7 @@ def compare_tvm_with_tflite(
         accel_type,
         output_tolerance=output_tolerance,
         print_cmm=print_cmm,
+        enable_cascader=enable_cascader,
     )
 
 
@@ -393,17 +475,26 @@ def get_convolutional_args(call, include_buffers=False, remove_constants=False):
     return conv_args
 
 
-def compute_ofm_shape(ifm_shape, padding, kernel_shape, strides, dilation=[1, 1]):
+def compute_ofm_shape(
+    ifm_shape, padding, kernel_shape, strides, dilation=[1, 1], channel_padding=[0, 0]
+):
     assert len(strides) == 2
     assert len(dilation) == 2
     assert len(kernel_shape) == 2
-    if padding.lower() == "valid":
+    if isinstance(padding, tuple):
+        h = (
+            ifm_shape[1] - (kernel_shape[0] - 1) * dilation[0] + padding[0] + padding[2]
+        ) // strides[0]
+        w = (
+            ifm_shape[2] - (kernel_shape[1] - 1) * dilation[1] + padding[1] + padding[3]
+        ) // strides[1]
+    elif padding.lower() == "valid":
         h = math.ceil((ifm_shape[1] - (kernel_shape[0] - 1) * dilation[0]) / strides[0])
         w = math.ceil((ifm_shape[2] - (kernel_shape[1] - 1) * dilation[1]) / strides[1])
-    if padding.lower() == "same":
+    elif padding.lower() == "same":
         h = math.ceil(ifm_shape[1] / strides[0])
         w = math.ceil(ifm_shape[2] / strides[1])
-    ofm_shape = [ifm_shape[0], h, w, ifm_shape[3]]
+    ofm_shape = [ifm_shape[0], h, w, ifm_shape[3] + channel_padding[0] + channel_padding[1]]
     return ofm_shape
 
 
@@ -550,6 +641,7 @@ def make_ethosu_pooling(
     pooling_type,
     pool_shape,
     ofm_channels,
+    ofm_dtype,
     strides,
     padding,
     activation="NONE",
@@ -568,6 +660,7 @@ def make_ethosu_pooling(
         ofm_zero_point=0,
         pool_shape=pool_shape,
         ofm_channels=ofm_channels,
+        ofm_dtype=ofm_dtype,
         strides=strides,
         padding=padding,
         activation=activation,
@@ -609,18 +702,28 @@ def make_ethosu_binary_elementwise(
     ifm2_layout="NHWC",
     ofm_layout="NHWC",
     rounding_mode="TFL",
+    use_rescale: bool = False,
+    rescale_scale: int = 0,
+    rescale_shift: int = 0,
+    lut=relay.const([], dtype="int8"),
+    ifm_scale: float = 1.0,
+    ifm_zero_point: int = 0,
+    ifm2_scale: float = 1.0,
+    ifm2_zero_point: int = 0,
+    ofm_scale: float = 1.0,
+    ofm_zero_point: int = 0,
 ):
     ethosu_binary_elementwise = ethosu_ops.ethosu_binary_elementwise(
         ifm=ifm,
         ifm2=ifm2,
-        lut=relay.const([], dtype="int8"),
+        lut=lut,
         operator_type=operator_type,
-        ifm_scale=1,
-        ifm_zero_point=0,
-        ifm2_scale=1,
-        ifm2_zero_point=0,
-        ofm_scale=1,
-        ofm_zero_point=0,
+        ifm_scale=ifm_scale,
+        ifm_zero_point=ifm_zero_point,
+        ifm2_scale=ifm2_scale,
+        ifm2_zero_point=ifm2_zero_point,
+        ofm_scale=ofm_scale,
+        ofm_zero_point=ofm_zero_point,
         ifm_channels=ifm_channels,
         ifm2_channels=ifm2_channels,
         reversed_operands=reversed_operands,
@@ -632,6 +735,9 @@ def make_ethosu_binary_elementwise(
         ifm_layout=ifm_layout,
         ifm2_layout=ifm2_layout,
         ofm_layout=ofm_layout,
+        use_rescale=use_rescale,
+        rescale_scale=rescale_scale,
+        rescale_shift=rescale_shift,
     )
     return ethosu_binary_elementwise
 

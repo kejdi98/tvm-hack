@@ -26,16 +26,17 @@
 #define TVM_LOG_STACK_TRACE 0
 #define TVM_LOG_DEBUG 0
 #define TVM_LOG_CUSTOMIZE 1
+
 #define DMLC_USE_LOGGING_LIBRARY <tvm/runtime/logging.h>
 
 #include <tvm/runtime/c_runtime_api.h>
 #include <tvm/runtime/logging.h>
 
 #include "src/runtime/c_runtime_api.cc"
+#include "src/runtime/container.cc"
 #include "src/runtime/contrib/sort/sort.cc"
 #include "src/runtime/cpu_device_api.cc"
 #include "src/runtime/file_utils.cc"
-#include "src/runtime/graph_executor/graph_executor.cc"
 #include "src/runtime/library_module.cc"
 #include "src/runtime/logging.cc"
 #include "src/runtime/module.cc"
@@ -51,6 +52,16 @@
 #include "src/runtime/rpc/rpc_session.cc"
 #include "src/runtime/system_library.cc"
 #include "src/runtime/workspace_pool.cc"
+// relax setup
+#include "src/runtime/memory/memory_manager.cc"
+#include "src/runtime/nvtx.cc"
+#include "src/runtime/relax_vm/builtin.cc"
+#include "src/runtime/relax_vm/bytecode.cc"
+#include "src/runtime/relax_vm/executable.cc"
+#include "src/runtime/relax_vm/lm_support.cc"
+#include "src/runtime/relax_vm/ndarray_cache_support.cc"
+#include "src/runtime/relax_vm/paged_kv_cache.cc"
+#include "src/runtime/relax_vm/vm.cc"
 
 // --- Implementations of backend and wasm runtime API. ---
 
@@ -68,19 +79,29 @@ namespace tvm {
 namespace runtime {
 namespace detail {
 // Override logging mechanism
-void LogFatalImpl(const std::string& file, int lineno, const std::string& message) {
+[[noreturn]] void LogFatalImpl(const std::string& file, int lineno, const std::string& message) {
   std::cerr << "[FATAL] " << file << ":" << lineno << ": " << message << std::endl;
   abort();
 }
 
-void LogMessageImpl(const std::string& file, int lineno, const std::string& message) {
-  std::cout << "[INFO] " << file << ":" << lineno << ": " << message << std::endl;
+void LogMessageImpl(const std::string& file, int lineno, int level, const std::string& message) {
+  static const char* level_strings_[] = {
+      "[DEBUG] ",
+      "[INFO] ",
+      "[WARNING] ",
+      "[ERROR] ",
+  };
+  std::cout << level_strings_[level] << file << ":" << lineno << ": " << message << std::endl;
 }
 
 }  // namespace detail
 
 TVM_REGISTER_GLOBAL("testing.echo").set_body([](TVMArgs args, TVMRetValue* ret) {
   *ret = args[0];
+});
+
+TVM_REGISTER_GLOBAL("testing.ret_string").set_body([](TVMArgs args, TVMRetValue* ret) {
+  *ret = args[0].operator String();
 });
 
 TVM_REGISTER_GLOBAL("testing.log_info_str").set_body([](TVMArgs args, TVMRetValue* ret) {
@@ -105,5 +126,28 @@ TVM_REGISTER_GLOBAL("testing.object_use_count").set_body([](TVMArgs args, TVMRet
   // and get another value.
   *ret = (obj.use_count() - 1);
 });
+
+void ArrayDecodeStorage(NDArray cpu_arr, std::string bytes, std::string format, std::string dtype) {
+  if (format == "f32-to-bf16" && dtype == "float32") {
+    std::vector<uint16_t> buffer(bytes.length() / 2);
+    std::memcpy(buffer.data(), bytes.data(), buffer.size() * 2);
+    // decode bf16 to f32
+    const uint16_t* bf16 = reinterpret_cast<const uint16_t*>(buffer.data());
+    uint32_t* data = static_cast<uint32_t*>(cpu_arr->data);
+    ICHECK(cpu_arr.IsContiguous());
+    size_t size = 1;
+    for (int i = 0; i < cpu_arr->ndim; ++i) {
+      size *= cpu_arr->shape[i];
+    }
+    ICHECK_EQ(size, bytes.length() / 2);
+    for (size_t i = 0; i < size; ++i) {
+      data[i] = static_cast<uint32_t>(bf16[i]) << 16;
+    }
+  } else {
+    cpu_arr.CopyFromBytes(bytes.data(), bytes.length());
+  }
+}
+
+TVM_REGISTER_GLOBAL("tvmjs.array.decode_storage").set_body_typed(ArrayDecodeStorage);
 }  // namespace runtime
 }  // namespace tvm

@@ -18,25 +18,18 @@
 """Schedule for dense operator"""
 import logging
 import tvm
-from tvm import te
-import tvm.autotvm as autotvm
+from tvm import te, autotvm
 from tvm.contrib import cublas
 from .tensor_intrin import dp4a
 from .. import tag
 from .. import generic
-from ..utils import traverse_inline, get_const_tuple, is_target
+from ..utils import traverse_inline, get_const_tuple
 
 logger = logging.getLogger("topi")
 
 
 def _matmul_cublas_common(
-    cfg,
-    tensor_a,
-    tensor_b,
-    bias=None,
-    out_dtype=None,
-    transpose_a=False,
-    transpose_b=False,
+    cfg, tensor_a, tensor_b, bias=None, out_dtype=None, transpose_a=False, transpose_b=False
 ):
     assert len(tensor_a.shape) == 2 and len(tensor_b.shape) == 2, "only support 2-dim matmul"
     if bias is not None:
@@ -59,13 +52,7 @@ def _matmul_cublas_common(
 
 @autotvm.register_topi_compute("matmul_cublas.cuda")
 def matmul_cublas(
-    cfg,
-    tensor_a,
-    tensor_b,
-    bias=None,
-    out_dtype=None,
-    transpose_a=False,
-    transpose_b=False,
+    cfg, tensor_a, tensor_b, bias=None, out_dtype=None, transpose_a=False, transpose_b=False
 ):
     """Matmul operator on CUDA with CUBLAS"""
     return _matmul_cublas_common(cfg, tensor_a, tensor_b, bias, out_dtype, transpose_a, transpose_b)
@@ -143,7 +130,7 @@ def _schedule_dense_int8(cfg, s, output):
     out_dim, _ = get_const_tuple(weight.shape)
 
     in_dim_factor = 4
-    assert in_dim % in_dim_factor == 0, "Input dimension must divide {}".format(in_dim_factor)
+    assert in_dim % in_dim_factor == 0, f"Input dimension must divide {in_dim_factor}"
     if in_dim % 16 == 0:
         in_dim_factor = 16
 
@@ -172,9 +159,7 @@ def _schedule_dense_int8(cfg, s, output):
     ko, ki = s[CC].split(ko, factor=4)
     ko, kt = cfg["tile_k"].apply(s, CC, ko)
     target = tvm.target.Target.current(allow_none=False)
-    do_tensorize = True
-    if is_target(["vulkan", "rocm"]):
-        do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
 
     if do_tensorize:
         dtypes = (data.dtype, weight.dtype)

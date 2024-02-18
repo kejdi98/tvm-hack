@@ -169,7 +169,7 @@ TEST(ThreadingBackend, TVMBackendAffinityConfigure) {
             std::atomic<size_t> acc(0);
             AffinityCheck ac(thread_pool_index, sys_max_concurrency, &acc);
             std::vector<unsigned int> cpus;
-            std::cout << affinity_mode << std::endl;
+            LOG(INFO) << affinity_mode << std::endl;
             for (int k = 0; k < cpus_num_per_thread; k++) {
               cpus.push_back(thread_pool_index * cpus_num_per_thread + k);
             }
@@ -183,5 +183,14 @@ TEST(ThreadingBackend, TVMBackendAffinityConfigure) {
   }
   for (auto& t : ts) {
     t->join();
+  }
+}
+
+TEST(ThreadingBackend, TVMBackendParallelForWithThreadingBackend) {
+  int n = 100;
+  std::vector<int> vec(/*size=*/n, /*value=*/0);
+  tvm::runtime::parallel_for_with_threading_backend([&vec](int i) { vec[i] = i; }, 0, n);
+  for (int i = 0; i < n; ++i) {
+    EXPECT_EQ(vec[i], i);
   }
 }

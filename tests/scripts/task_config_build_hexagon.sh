@@ -16,8 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
 BUILD_DIR=$1
 mkdir -p "$BUILD_DIR"
@@ -29,8 +28,20 @@ echo set\(USE_RPC ON\) >> config.cmake
 echo set\(USE_MICRO ON\) >> config.cmake
 echo set\(USE_MICRO_STANDALONE_RUNTIME ON\) >> config.cmake
 echo set\(USE_LLVM "${CLANG_LLVM_HOME}/bin/llvm-config"\) >> config.cmake
-echo set\(CMAKE_CXX_COMPILER "${CLANG_LLVM_HOME}/bin/clang++"\) >> config.cmake
+
+if [[ ${CI:-false} == "true" ]]; then
+    # sccache needs to be used in CI to speed up builds
+    echo set\(CMAKE_C_COMPILER "/opt/sccache/cc"\) >> config.cmake
+    echo set\(CMAKE_CXX_COMPILER "/opt/sccache/c++"\) >> config.cmake
+else
+    echo 'Skipping sccache setup for local build'
+    echo set\(CMAKE_C_COMPILER \"/usr/bin/cc\"\) >> config.cmake
+    echo set\(CMAKE_CXX_COMPILER \"/usr/bin/c++\"\) >> config.cmake
+fi
+
 echo set\(USE_HEXAGON "ON"\) >> config.cmake
-echo set\(USE_HEXAGON_SDK "${HEXAGON_SDK_PATH}"\) >> config.cmake
+echo set\(USE_HEXAGON_SDK "${HEXAGON_SDK_ROOT}"\) >> config.cmake
 echo set\(USE_CCACHE OFF\) >> config.cmake
+echo set\(BACKTRACE_ON_SEGFAULT ON\) >> config.cmake
 echo set\(SUMMARIZE ON\) >> config.cmake
+echo set\(USE_HEXAGON_QHL ON\) >> config.cmake

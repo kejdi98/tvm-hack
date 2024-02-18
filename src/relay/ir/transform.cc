@@ -126,7 +126,7 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
 
   IRModule updated_mod = mod->ShallowCopy();
 
-  std::vector<std::pair<GlobalVar, Function> > updates;
+  std::vector<std::pair<GlobalVar, Function>> updates;
   for (const auto& kv : mod->functions) {
     // only process optimizable Relay Functions
     if (const auto* function_node = AsOptimizableFunctionNode(kv.second)) {
@@ -154,8 +154,8 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
 
 Pass CreateFunctionPass(
     const runtime::TypedPackedFunc<Function(Function, IRModule, PassContext)>& pass_func,
-    int opt_level, String name, tvm::Array<String> required) {
-  PassInfo pass_info = PassInfo(opt_level, name, required);
+    int opt_level, String name, tvm::Array<String> required, bool traceable) {
+  PassInfo pass_info = PassInfo(opt_level, name, required, traceable);
   return FunctionPass(pass_func, pass_info);
 }
 

@@ -256,7 +256,7 @@ class JSONGraphNode {
    */
   template <typename T>
   T GetAttr(const std::string& key) const {
-    ICHECK_GT(attrs_.count(key), 0U) << "Key: " << key << "is not found";
+    ICHECK_GT(attrs_.count(key), 0U) << "Key: " << key << " is not found";
     return dmlc::get<T>(attrs_.at(key));
   }
 
@@ -280,6 +280,12 @@ class JSONGraphNode {
    * \return True if attribute exists, false otherwise.
    */
   bool HasAttr(const std::string& key) const { return attrs_.find(key) != attrs_.end(); }
+
+  void CaptureAttrs(const JSONGraphNode& that) {
+    for (const auto& kv : that.attrs_) {
+      attrs_[kv.first] = kv.second;
+    }
+  }
 
   virtual ~JSONGraphNode() {}
 

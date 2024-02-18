@@ -43,10 +43,10 @@ Expr MakeConvWinogradWeightTransform(Expr weight, int tile_size, std::string op_
   return Call(op, {weight}, Attrs(attrs), {});
 }
 
-Expr MakeConvGemmWeightTransform(Expr weight, int tile_rows, int tile_cols, std::string op_name) {
+Expr MakeConvGemmWeightTransform(Expr weight, int tile_N, int tile_K, std::string op_name) {
   auto attrs = make_object<ConvGemmWeightTransformAttrs>();
-  attrs->tile_rows = tile_rows;
-  attrs->tile_cols = tile_cols;
+  attrs->tile_N = tile_N;
+  attrs->tile_K = tile_K;
   const Op& op = Op::Get(op_name);
   return Call(op, {weight}, Attrs(attrs), {});
 }
@@ -173,7 +173,8 @@ with the layer input to produce a tensor of outputs.
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(2)
     .add_type_rel("Conv1D", Conv1DRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv1DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv1DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.conv2d
 TVM_REGISTER_NODE_TYPE(Conv2DAttrs);
@@ -188,6 +189,18 @@ bool Conv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   Layout kOIHW("OIHW");
 
   const auto* param = attrs.as<Conv2DAttrs>();
+  DataType out_dtype = param->out_dtype;
+  if (out_dtype.bits() == 0) {
+    out_dtype = data->dtype;
+    if (out_dtype.bits() == 0 && weight != nullptr) {
+      out_dtype = weight->dtype;
+    }
+  }
+  TensorType meta_schedule_weight{nullptr};
+  if (param->meta_schedule_original_shape.size() != 0) {
+    meta_schedule_weight = TensorType(param->meta_schedule_original_shape, out_dtype);
+    weight = meta_schedule_weight.get();
+  }
   ICHECK(param != nullptr);
   const Layout in_layout(param->data_layout);
   const Layout kernel_layout(param->kernel_layout);
@@ -273,27 +286,27 @@ bool Conv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
       weight_dtype = weight->dtype;
     }
 
-    if (param->auto_scheduler_rewritten_layout.size() == 0) {
-      // Normal case: assign result to reporter
-      reporter->Assign(types[1], TensorType(wshape, weight_dtype));
-    } else {
+    if (param->auto_scheduler_rewritten_layout.size() != 0) {
       // If the layout is rewritten by auto-scheduler,
       // we just forcly apply the layout provided by auto-scheduler and
       // skip the normal inference logic.
       {}  // do nothing
+    } else if (param->meta_schedule_original_shape.size() == 0) {
+      // Normal case: assign result to reporter
+      reporter->Assign(types[1], TensorType(wshape, weight_dtype));
     }
   } else {
     // use weight to infer the conv shape.
     if (weight == nullptr) return false;
 
     Array<PrimExpr> wshape;
-    if (param->auto_scheduler_rewritten_layout.size() == 0) {
-      wshape = weight->shape;
-    } else {
+    if (param->auto_scheduler_rewritten_layout.size() != 0) {
       // works for the default kernel layout "HWIO"
       ICHECK_EQ(param->kernel_layout, "HWIO");
       wshape = auto_scheduler::GetShapeFromRewrittenLayout(param->auto_scheduler_rewritten_layout,
                                                            {"ry", "rx", "rc", "ff"});
+    } else {
+      wshape = weight->shape;
     }
 
     wshape = trans_kernel_layout.ForwardShape(wshape);
@@ -357,10 +370,6 @@ bool Conv2DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   } else {
     oshape.Set(3, dshape_nchw[3]);
   }
-  DataType out_dtype = param->out_dtype;
-  if (out_dtype.bits() == 0) {
-    out_dtype = data->dtype;
-  }
   oshape = trans_out_layout.BackwardShape(oshape);
   // assign output type
   reporter->Assign(types[2], TensorType(oshape, out_dtype));
@@ -396,7 +405,8 @@ with the layer input to produce a tensor of outputs.
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(2)
     .add_type_rel("Conv2D", Conv2DRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.conv3d
 TVM_REGISTER_NODE_TYPE(Conv3DAttrs);
@@ -412,6 +422,18 @@ bool Conv3DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 
   const auto* param = attrs.as<Conv3DAttrs>();
   ICHECK(param != nullptr);
+  DataType out_dtype = param->out_dtype;
+  if (out_dtype.bits() == 0) {
+    out_dtype = data->dtype;
+    if (out_dtype.bits() == 0 && weight != nullptr) {
+      out_dtype = weight->dtype;
+    }
+  }
+  TensorType meta_schedule_weight{nullptr};
+  if (param->meta_schedule_original_shape.size() != 0) {
+    meta_schedule_weight = TensorType(param->meta_schedule_original_shape, out_dtype);
+    weight = meta_schedule_weight.get();
+  }
   const Layout in_layout(param->data_layout);
   const Layout kernel_layout(param->kernel_layout);
 
@@ -438,16 +460,31 @@ bool Conv3DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   if (param->kernel_size.defined() && param->channels.defined()) {
     ICHECK_EQ(param->kernel_size.size(), 3);
     ICHECK_EQ(param->dilation.size(), 3);
-    Array<IndexExpr> wshape;
-    tvm::tir::ExprDeepEqual expr_equal;
 
-    if (expr_equal(param->channels, param->groups) && !expr_equal(param->channels, 1)) {
-      // infer weight's shape for depthwise convolution
-      wshape = {{dshape_ncdhw[1], indexdiv(param->groups, dshape_ncdhw[1]), param->kernel_size[0],
-                 param->kernel_size[1], param->kernel_size[2]}};
+    bool is_depthwise = false;
+    if (param->groups > 1) {
+      if (!(weight && weight->shape.defined())) {
+        reporter->GetDiagCtx().Emit(
+            Diagnostic::Error(reporter->GetSpan())
+            << "Weight shape must be specified when groups is greater than 1.");
+        return false;
+      }
+
+      Array<IndexExpr> wshape_oidhw = trans_kernel_layout.ForwardShape(weight->shape);
+      if (tvm::tir::ExprDeepEqual()(param->groups, dshape_ncdhw[1]) &&
+          tvm::tir::ExprDeepEqual()(param->groups, wshape_oidhw[0])) {
+        is_depthwise = true;
+      }
+    }
+
+    Array<IndexExpr> wshape;
+    if (is_depthwise) {
+      auto channel_multiplier = indexdiv(param->channels, dshape_ncdhw[1]);
+      wshape = {dshape_ncdhw[1], channel_multiplier, param->kernel_size[0], param->kernel_size[1],
+                param->kernel_size[2]};
     } else {
-      wshape = {{param->channels, indexdiv(dshape_ncdhw[1], param->groups), param->kernel_size[0],
-                 param->kernel_size[1], param->kernel_size[2]}};
+      wshape = {param->channels, indexdiv(dshape_ncdhw[1], param->groups), param->kernel_size[0],
+                param->kernel_size[1], param->kernel_size[2]};
     }
 
     wshape = trans_kernel_layout.BackwardShape(wshape);
@@ -460,14 +497,14 @@ bool Conv3DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
       weight_dtype = weight->dtype;
     }
 
-    if (param->auto_scheduler_rewritten_layout.size() == 0) {
-      // Normal case: assign result to reporter
-      reporter->Assign(types[1], TensorType(wshape, weight_dtype));
-    } else {
+    if (param->auto_scheduler_rewritten_layout.size() != 0) {
       // If the layout is rewritten by auto-scheduler,
       // we just forcly apply the layout provided by auto-scheduler and
       // skip the normal inference logic.
       {}  // do nothing
+    } else if (param->meta_schedule_original_shape.size() == 0) {
+      // Normal case: assign result to reporter
+      reporter->Assign(types[1], TensorType(wshape, weight_dtype));
     }
 
   } else {
@@ -475,13 +512,13 @@ bool Conv3DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
     if (weight == nullptr) return false;
 
     Array<PrimExpr> wshape;
-    if (param->auto_scheduler_rewritten_layout.size() == 0) {
-      wshape = weight->shape;
-    } else {
+    if (param->auto_scheduler_rewritten_layout.size() != 0) {
       // works for the default kernel layout "DHWIO"
       ICHECK_EQ(param->kernel_layout, "DHWIO");
       wshape = auto_scheduler::GetShapeFromRewrittenLayout(param->auto_scheduler_rewritten_layout,
                                                            {"rd", "rh", "rw", "rc", "cc"});
+    } else {
+      wshape = weight->shape;
     }
 
     wshape = trans_kernel_layout.ForwardShape(wshape);
@@ -531,10 +568,6 @@ bool Conv3DRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   } else {
     oshape.Set(4, dshape_ncdhw[4]);
   }
-  DataType out_dtype = param->out_dtype;
-  if (out_dtype.bits() == 0) {
-    out_dtype = data->dtype;
-  }
   oshape = trans_out_layout.BackwardShape(oshape);
   // assign output type
   reporter->Assign(types[2], TensorType(oshape, out_dtype));
@@ -571,7 +604,8 @@ with the layer input to produce a tensor of outputs.
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(2)
     .add_type_rel("Conv3D", Conv3DRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv3DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv3DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.conv3d_transpose
 TVM_REGISTER_NODE_TYPE(Conv3DTransposeAttrs);
@@ -585,7 +619,7 @@ bool Conv3DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
   if (data == nullptr) return false;
 
   static const Layout kNCDHW("NCDHW");
-  static const Layout kOIDHW("OIDHW");
+  static const Layout kIODHW("IODHW");
 
   const Conv3DTransposeAttrs* param = attrs.as<Conv3DTransposeAttrs>();
   ICHECK(param != nullptr);
@@ -597,9 +631,9 @@ bool Conv3DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
       << "Conv3d_transpose only support input layouts that are convertible from NCDHW."
       << " But got " << in_layout;
 
-  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kOIDHW);
+  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kIODHW);
   ICHECK(trans_kernel_layout.defined())
-      << "Conv3d_transpose only support kernel layouts that are convertible from OIDHW."
+      << "Conv3d_transpose only support kernel layouts that are convertible from IODHW."
       << " But got " << kernel_layout;
 
   Layout out_layout(param->out_layout == "" ? param->data_layout : param->out_layout);
@@ -642,16 +676,18 @@ bool Conv3DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
       ICHECK(reporter->AssertEQ(param->kernel_size[0], wshape[2]) &&
              reporter->AssertEQ(param->kernel_size[1], wshape[3]) &&
              reporter->AssertEQ(param->kernel_size[2], wshape[4]))
-          << "Conv3D: shape of weight is inconsistent with kernel_size, "
+          << "Conv3DTransposed: shape of weight is inconsistent with kernel_size, "
           << " kernel_size=" << param->kernel_size << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (param->channels.defined()) {
-      ICHECK(reporter->AssertEQ(param->channels, wshape[1]))
-          << "Conv3D: shape of weight is inconsistent with channels, "
-          << " channels=" << param->channels << " wshape=" << Array<IndexExpr>(wshape);
+      ICHECK(reporter->AssertEQ(indexdiv(param->channels, param->groups), wshape[1]))
+          << "Conv3DTransposed: shape of weight is inconsistent out_channels, "
+          << " out_channels // groups != weight.shape[1] "
+          << " out_channels=" << param->channels << " groups=" << param->groups
+          << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (!dshape_ncdhw[1].as<tir::AnyNode>() && !wshape[0].as<tir::AnyNode>()) {
-      ICHECK(reporter->AssertEQ(indexdiv(dshape_ncdhw[1], param->groups), wshape[0]));
+      ICHECK(reporter->AssertEQ(dshape_ncdhw[1], wshape[0]));
     }
     channels = wshape[1];
     dilated_ksize_d = 1 + (wshape[2] - 1) * param->dilation[0];
@@ -732,7 +768,8 @@ said convolution.
     .set_support_level(2)
     .set_attr<FInferCorrectLayout>("FInferCorrectLayout",
                                    ConvInferCorrectLayout<Conv3DTransposeAttrs>)
-    .add_type_rel("Conv3DTranspose", Conv3DTransposeRel<Conv3DTransposeAttrs>);
+    .add_type_rel("Conv3DTranspose", Conv3DTransposeRel<Conv3DTransposeAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.conv2d_transpose
 TVM_REGISTER_NODE_TYPE(Conv2DTransposeAttrs);
@@ -900,7 +937,8 @@ v            (batch_size, channels, out_height, out_width) if `layout` is `NCHW`
     .set_support_level(2)
     .set_attr<FInferCorrectLayout>("FInferCorrectLayout",
                                    ConvInferCorrectLayout<Conv2DTransposeAttrs>)
-    .add_type_rel("Conv2DTranspose", Conv2DTransposeRel);
+    .add_type_rel("Conv2DTranspose", Conv2DTransposeRel)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.conv1d_transpose
 TVM_REGISTER_NODE_TYPE(Conv1DTransposeAttrs);
@@ -913,7 +951,7 @@ bool Conv1DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
   if (data == nullptr) return false;
 
   static const Layout kNCW("NCW");
-  static const Layout kOIW("OIW");
+  static const Layout kIOW("IOW");
 
   const Conv1DTransposeAttrs* param = attrs.as<Conv1DTransposeAttrs>();
   ICHECK(param != nullptr);
@@ -925,9 +963,9 @@ bool Conv1DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
       << "Conv only support input layouts that are convertible from NCW."
       << " But got " << in_layout;
 
-  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kOIW);
+  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kIOW);
   ICHECK(trans_kernel_layout.defined())
-      << "Conv only support kernel layouts that are convertible from OIW."
+      << "Conv only support kernel layouts that are convertible from IOW."
       << " But got " << kernel_layout;
 
   Layout out_layout(param->out_layout == "" ? param->data_layout : param->out_layout);
@@ -966,16 +1004,18 @@ bool Conv1DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
       ICHECK_EQ(param->kernel_size.size(), 1);
       // check the size
       ICHECK(reporter->AssertEQ(param->kernel_size[0], wshape[2]))
-          << "Conv1D: shape of weight is inconsistent with kernel_size, "
+          << "Conv1DTraspose: shape of weight is inconsistent with kernel_size, "
           << " kernel_size=" << param->kernel_size << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (param->channels.defined()) {
-      ICHECK(reporter->AssertEQ(param->channels, wshape[1]))
-          << "Conv1D: shape of weight is inconsistent with channels, "
-          << " channels=" << param->channels << " wshape=" << Array<IndexExpr>(wshape);
+      ICHECK(reporter->AssertEQ(indexdiv(param->channels, param->groups), wshape[1]))
+          << "Conv1DTraspose: shape of weight is inconsistent with channels, "
+          << " out_channels // groups != weight.shape[1] "
+          << " out_channels=" << param->channels << " groups=" << param->groups
+          << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (!dshape_ncw[1].as<tir::AnyNode>() && !wshape[0].as<tir::AnyNode>()) {
-      ICHECK(reporter->AssertEQ(indexdiv(dshape_ncw[1], param->groups), wshape[0]));
+      ICHECK(reporter->AssertEQ(dshape_ncw[1], wshape[0]));
     }
     channels = wshape[1];
     dilated_ksize_x = 1 + (wshape[2] - 1) * param->dilation[0];
@@ -1036,7 +1076,8 @@ said convolution.
     .add_argument("data", "Tensor", "The input tensor.")
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(2)
-    .add_type_rel("Conv1DTranspose", Conv1DTransposeRel);
+    .add_type_rel("Conv1DTranspose", Conv1DTransposeRel)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv2d_winograd_without_weight_transform
 TVM_REGISTER_NODE_TYPE(Conv2DWinogradAttrs);
@@ -1071,7 +1112,8 @@ RELAY_REGISTER_OP("nn.contrib_conv2d_winograd_without_weight_transform")
     .set_support_level(10)
     .add_type_rel("Conv2DWinograd", Conv2DWinogradRel<Conv2DWinogradAttrs>)
     .set_attr<FInferCorrectLayout>("FInferCorrectLayout",
-                                   ConvInferCorrectLayout<Conv2DWinogradAttrs>);
+                                   ConvInferCorrectLayout<Conv2DWinogradAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv2d_winograd_weight_transform
 TVM_REGISTER_NODE_TYPE(ConvWinogradWeightTransformAttrs);
@@ -1116,7 +1158,8 @@ weight transformation in advance.
     .set_num_inputs(1)
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
-    .add_type_rel("Conv2DWinogradWeightTransform", Conv2DWinogradWeightTransformRel);
+    .add_type_rel("Conv2DWinogradWeightTransform", Conv2DWinogradWeightTransformRel)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv3d_winograd_without_weight_transform
 TVM_REGISTER_NODE_TYPE(Conv3DWinogradAttrs);
@@ -1233,7 +1276,8 @@ RELAY_REGISTER_OP("nn.contrib_conv3d_winograd_without_weight_transform")
     .set_support_level(10)
     .add_type_rel("Conv3DWinograd", Conv3DWinogradRel)
     .set_attr<FInferCorrectLayout>("FInferCorrectLayout",
-                                   ConvInferCorrectLayout<Conv3DWinogradAttrs>);
+                                   ConvInferCorrectLayout<Conv3DWinogradAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv3d_winograd_weight_transform
 TVM_REGISTER_GLOBAL("relay.op.nn._make.contrib_conv3d_winograd_weight_transform")
@@ -1283,7 +1327,8 @@ weight transformation in advance.
     .set_num_inputs(1)
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
-    .add_type_rel("Conv3DWinogradWeightTransform", Conv3DWinogradWeightTransformRel);
+    .add_type_rel("Conv3DWinogradWeightTransform", Conv3DWinogradWeightTransformRel)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv2d_winograd_nnpack_weight_transform
 TVM_REGISTER_NODE_TYPE(Conv2DWinogradNNPACKWeightTransformAttrs);
@@ -1341,7 +1386,8 @@ weight transformation in advance.
     .set_num_inputs(1)
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
-    .add_type_rel("Conv2DWinogradNNPACKWeightTransform", Conv2DWinogradNNPACKWeightTransformRel);
+    .add_type_rel("Conv2DWinogradNNPACKWeightTransform", Conv2DWinogradNNPACKWeightTransformRel)
+    .set_attr<TOpPattern>("TOpPattern", kOpaque);
 
 // relay.nn.contrib_conv2d_gemm_without_weight_transform
 TVM_REGISTER_GLOBAL("relay.op.nn._make.contrib_conv2d_gemm_without_weight_transform")
@@ -1443,20 +1489,22 @@ RELAY_REGISTER_OP("nn.contrib_conv2d_gemm_without_weight_transform")
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
     .add_type_rel("Conv2DGemm", Conv2DGemmRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // relay.nn.contrib_conv2d_gemm_weight_transform
 
 TVM_REGISTER_NODE_TYPE(ConvGemmWeightTransformAttrs);
 
 // Gemm convolution shape relations
-// In order to run GEMM we need to block-transpose and interleave the K x N weights matrix W.
-// The high level idea is to subdivide W in tiles of tile_cols x tile_rows, and transpose and
-// interleave them. The final output is a [N//tile_rows, K//tile_cols, tile_rows, tile_cols]
+// In order to run GEMM we need to transform the K x N weights matrix W.
+//
+// For integer datatypes, the high level idea is to subdivide W in tiles of tile_K x tile_N, and
+// transpose and interleave them. The final output is a [N//tile_N, K//tile_K, tile_N, tile_K]
 // matrix that we call W_interleaved_t.
 //
-// In the following picture, we show how the first [tile_cols,tile_rows] block of W is transformed
-// for tile_rows = 4 and tile_cols = 16
+// In the following picture, we show how the first [tile_K,tile_N] block of W is transformed
+// for tile_N = 4 and tile_K = 16
 //
 //              W[0,0,:,:]                        W_interleaved_t[0,0,:,:]
 //  +-------------------------------+     +----------------------------------- +
@@ -1468,9 +1516,31 @@ TVM_REGISTER_NODE_TYPE(ConvGemmWeightTransformAttrs);
 //  |W[15,0] W[15,1] W[15,2] W[15,3]|
 //  +-------------------------------+
 //
-// Tile columns is usually the direction of the reduction. So, if our target can reduce k elements
-// at the time, we should set tile_cols = k.
-// Tile rows is connected with the number of registers available for the given target.
+// Alternatively, for floating point datatypes, we subdivide W in tiles of tile_K x tile_N size,
+// then interleave these tiles, without transposing. The final output is a [N//tile_N, K//tile_K,
+// tile_K, tile_N] matrix called W_interleaved.
+//
+// In the following illustration, we show how the tiles are interleaved.
+// Note that the inside of each tile is kept unchanged during this tranformation.
+//
+//           W[:,:,:,:]               W_interleaved[:,:,:,:]
+//  +--------+--------+--------+       +--------+--------+
+//  |        |        |        |       |        |        |
+//  | tile_1 | tile_2 | tile_3 |       | tile_1 | tile_4 |
+//  |        |        |        |  --\  |        |        |
+//  +--------+--------+--------+  --/  +--------+--------+
+//  |        |        |        |       |        |        |
+//  | tile_4 | tile_5 | tile_6 |       | tile_2 | tile_5 |
+//  |        |        |        |       |        |        |
+//  +--------+--------+--------+       +--------+--------+
+//                                     |        |        |
+//                                     | tile_3 | tile_6 |
+//                                     |        |        |
+//                                     +--------+--------+
+//
+// Tile K is the direction of the reduction in both cases. So, if our target can reduce k elements
+// at the time, we should set tile_K = k.
+// Tile N is connected with the number of registers available for the given target.
 //
 bool Conv2DGemmWeightTransformRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                                   const TypeReporter& reporter) {
@@ -1480,29 +1550,38 @@ bool Conv2DGemmWeightTransformRel(const Array<Type>& types, int num_inputs, cons
 
   const ConvGemmWeightTransformAttrs* param = attrs.as<ConvGemmWeightTransformAttrs>();
   ICHECK(param != nullptr);
-  int n = param->tile_rows;
-  int k = param->tile_cols;
+  int n = param->tile_N;
+  int k = param->tile_K;
 
   ICHECK_EQ(weight->shape.size(), 4) << "Only support HWIO kernel layout";
 
   const auto K = weight->shape[0] * weight->shape[1] * weight->shape[2];
   const auto N = weight->shape[3];
 
-  auto K_mod_k = indexmod(K, k);
+  auto K_mod_k = indexmod(K, k * 4);
   auto N_mod_n = indexmod(N, n);
 
-  auto pad_K = tvm::if_then_else(K_mod_k != 0, k - K_mod_k, tir::make_zero(DataType::Int(32)));
+  auto pad_K = tvm::if_then_else(K_mod_k != 0, k * 4 - K_mod_k, tir::make_zero(DataType::Int(32)));
   auto pad_N = tvm::if_then_else(N_mod_n != 0, n - N_mod_n, tir::make_zero(DataType::Int(32)));
 
   const auto N_padded = N + pad_N;
   const auto K_padded = K + pad_K;
 
-  Array<IndexExpr> oshape{
-      indexdiv(N_padded, n),
-      indexdiv(K_padded, k),
-      n,
-      k,
-  };
+  Array<IndexExpr> oshape;
+  if (weight->dtype.bits() == 8 && (weight->dtype.is_int() || weight->dtype.is_uint()))
+    oshape = {
+        indexdiv(N_padded, n),
+        indexdiv(K_padded, k),
+        n,
+        k,
+    };
+  else
+    oshape = {
+        indexdiv(N_padded, n),
+        indexdiv(K_padded, k),
+        k,
+        n,
+    };
 
   reporter->Assign(types[1], TensorType(oshape, weight->dtype));
   return true;
@@ -1525,7 +1604,8 @@ weight transformation in advance.
     .set_num_inputs(1)
     .add_argument("weights", "Tensor", "The weights tensor.")
     .set_support_level(10)
-    .add_type_rel("Conv2DGemmWeightTransform", Conv2DGemmWeightTransformRel);
+    .add_type_rel("Conv2DGemmWeightTransform", Conv2DGemmWeightTransformRel)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // Positional relay function to create conv2d NCHWc operator
 // used by frontend FFI.
@@ -1552,7 +1632,8 @@ RELAY_REGISTER_OP("nn.contrib_conv2d_NCHWc")
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
     .add_type_rel("Conv2DNCHWc", Conv2DWinogradRel<Conv2DAttrs>)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // Positional relay function to create depthwise conv2d NCHWc operator
 // used by frontend FFI.
@@ -1579,7 +1660,8 @@ RELAY_REGISTER_OP("nn.contrib_depthwise_conv2d_NCHWc")
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(10)
     .add_type_rel("Conv2D", Conv2DRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 TVM_REGISTER_NODE_TYPE(DeformableConv2DAttrs);
 
@@ -1732,7 +1814,8 @@ by concating all the *g* results.
     .add_argument("weight", "Tensor", "The weight tensor.")
     .set_support_level(5)
     .add_type_rel("DeformableConv2D", DeformableConv2DRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", DeformableConvInferCorrectLayout);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", DeformableConvInferCorrectLayout)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 // Positional relay function to create deformable_conv2d operator
 // used by frontend FFI.
@@ -1852,7 +1935,8 @@ RELAY_REGISTER_OP("nn.conv2d_backward_weight")
     .add_argument("data", "Tensor", "The input tensor.")
     .set_support_level(2)
     .add_type_rel("Conv2DBackwardWeight", Conv2DBackwardWeightRel)
-    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>);
+    .set_attr<FInferCorrectLayout>("FInferCorrectLayout", ConvInferCorrectLayout<Conv2DAttrs>)
+    .set_attr<TOpPattern>("TOpPattern", kOutEWiseFusable);
 
 
 // // Newly added MCUConv2dOPs

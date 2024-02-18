@@ -78,12 +78,14 @@ def test_simple_strided_slice_identity_removal():
     in the graph and a compute operation follows."""
 
     def get_graph(get_expected=False):
-        x = relay.var("x", shape=(1, 2, 2, 4), dtype="int8")
-        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 4, (1, 1), (0, 0))
+        dtype = "int8"
+
+        x = relay.var("x", shape=(1, 2, 2, 4), dtype=dtype)
+        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 4, dtype, (1, 1), (0, 0))
         x = relay.strided_slice(x, begin=[0, 0, 0, 0], end=[1, 2, 2, 2])
         if not get_expected:
             x = infra.make_ethosu_identity(x)
-        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 2, (1, 1), (0, 0))
+        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 2, dtype, (1, 1), (0, 0))
         return relay.Function(relay.analysis.free_vars(x), x)
 
     actual = _optimize(get_graph())
@@ -95,9 +97,11 @@ def test_no_identity():
     """Check the graph is not affected when there is no identity in the graph."""
 
     def get_graph():
-        x = relay.var("x", shape=(1, 2, 2, 4), dtype="int8")
+        dtype = "int8"
+
+        x = relay.var("x", shape=(1, 2, 2, 4), dtype=dtype)
         x = infra.make_ethosu_conv2d(x, 4, 4, (1, 1), (0, 0), (1, 1), (1, 1))
-        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 4, (1, 1), (0, 0))
+        x = infra.make_ethosu_pooling(x, "MAX", (1, 1), 4, dtype, (1, 1), (0, 0))
         x = infra.make_ethosu_depthwise_conv2d(x, 4, (1, 1), (0, 0), (1, 1), (1, 1))
         x = infra.make_ethosu_unary_elementwise(x, 4, "ABS")
         return relay.Function(relay.analysis.free_vars(x), x)
@@ -322,7 +326,7 @@ def test_same_output():
         z = tf.reshape(z, (1, 1, 25, 8))
         return z
 
-    infra.compare_tvm_with_tflite(model, ifm_shapes, "ethos-u55-256")
+    infra.compare_tvm_with_tflite(model, ifm_shapes, "ethos-u55-256", enable_cascader=False)
 
 
 def test_multi_output_identity_has_same_output():
@@ -340,7 +344,7 @@ def test_multi_output_identity_has_same_output():
         y = tf.concat(outputs, axis=0)
         return y
 
-    infra.compare_tvm_with_tflite(model, [ifm_shape], "ethos-u55-256")
+    infra.compare_tvm_with_tflite(model, [ifm_shape], "ethos-u55-256", enable_cascader=False)
 
 
 def test_multiple_transform_ops_same_output():
@@ -355,4 +359,4 @@ def test_multiple_transform_ops_same_output():
         x = tf.reshape(x, (12,))
         return x
 
-    infra.compare_tvm_with_tflite(model, [ifm_shape], "ethos-u55-256")
+    infra.compare_tvm_with_tflite(model, [ifm_shape], "ethos-u55-256", enable_cascader=False)

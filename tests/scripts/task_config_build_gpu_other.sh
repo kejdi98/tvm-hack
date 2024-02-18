@@ -18,9 +18,7 @@
 
 # This file is a compiler test to ensure that runtimes can compile
 # correctly, even if they aren't actively tested in the CI.
-
-set -e
-set -u
+set -euxo pipefail
 
 BUILD_DIR=$1
 mkdir -p "$BUILD_DIR"
@@ -33,5 +31,6 @@ echo set\(USE_MICRO ON\) >> config.cmake
 echo set\(USE_PROFILER ON\) >> config.cmake
 echo set\(USE_LIBBACKTRACE OFF\) >> config.cmake
 echo set\(CMAKE_CXX_FLAGS -Werror\) >> config.cmake
+echo set\(BACKTRACE_ON_SEGFAULT ON\) >> config.cmake
 echo set\(USE_CCACHE OFF\) >> config.cmake
 echo set\(SUMMARIZE ON\) >> config.cmake

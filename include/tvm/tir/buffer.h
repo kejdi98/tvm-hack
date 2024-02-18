@@ -25,6 +25,7 @@
 #define TVM_TIR_BUFFER_H_
 
 #include <tvm/ir/expr.h>
+#include <tvm/node/script_printer.h>
 #include <tvm/runtime/container/array.h>
 #include <tvm/runtime/container/string.h>
 #include <tvm/tir/var.h>
@@ -33,6 +34,18 @@
 
 namespace tvm {
 namespace tir {
+
+#ifndef TVM_INDEX_DEFAULT_I64
+#define TVM_INDEX_DEFAULT_I64 1
+#endif
+/*! \brief if TVM_INDEX_DEFAULT_I64 is set, return int64, otherwise return int32 */
+inline DataType DefaultIndexType() {
+#if TVM_INDEX_DEFAULT_I64
+  return DataType::Int(64);
+#else
+  return DataType::Int(32);
+#endif
+}
 
 // forward declare Stmt
 class Stmt;
@@ -135,7 +148,7 @@ class BufferNode : public Object {
 
   /*! \return preferred index type for this buffer node */
   DataType DefaultIndexType() const {
-    return shape.size() != 0 ? shape[0].dtype() : DataType::Int(32);
+    return shape.size() != 0 ? shape[0].dtype() : tvm::tir::DefaultIndexType();
   }
 
   /*! \brief Determine the offset in the buffer of the given index.
@@ -150,6 +163,7 @@ class BufferNode : public Object {
   static constexpr const bool _type_has_method_sequal_reduce = true;
   static constexpr const bool _type_has_method_shash_reduce = true;
   TVM_DECLARE_FINAL_OBJECT_INFO(BufferNode, Object);
+  TVM_OBJECT_ENABLE_SCRIPT_PRINTER();
 };
 
 /*!
@@ -186,10 +200,11 @@ class Buffer : public ObjectRef {
    * \param ptr_type The type of the pointer.
    * \param content_lanes The number of lanes for the (data) type.
    * \param offset The offset of ptr.
+   * \param input_extent The extent of ptr.
    */
   TVM_DLL PrimExpr access_ptr(int access_mask, DataType ptr_type = DataType::Handle(),
-                              int content_lanes = 1,
-                              PrimExpr offset = IntImm(DataType::Int(32), 0)) const;
+                              int content_lanes = 1, PrimExpr offset = IntImm(DataType::Int(32), 0),
+                              Optional<PrimExpr> input_extent = NullOpt) const;
   /*!
    * \brief Create an Expr that does a vector load at begin index.
    * \param begin The beginning index
@@ -294,6 +309,23 @@ class DataProducer : public ObjectRef {
   TVM_DEFINE_OBJECT_REF_METHODS(DataProducer, ObjectRef, DataProducerNode);
 };
 
+/*!
+ * \brief Creates TIR Buffer for provided parameters
+ * \param shape shape of the buffer
+ * \param dtype data type
+ * \param name buffer name
+ * \param data_alignment alignment requirement of data pointer in bytes
+ * \param offset_factor Factor of elem_offset field, elem_offset is guaranteed to be
+ *                      multiple of offset_factor
+                        User can specify data_alignment and offset_factor to be 0
+ *                      A default value will be picked.
+ * \param compact If the statement has already bound to a compact buffer.
+ * \param memory_scope memory scope of the buffer
+ */
+TVM_DLL tir::Buffer BufferWithOffsetAlignment(Array<PrimExpr> shape, DataType dtype,
+                                              std::string name, int data_alignment,
+                                              int offset_factor, bool compact,
+                                              std::string memory_scope = "");
 }  // namespace tir
 }  // namespace tvm
 #endif  // TVM_TIR_BUFFER_H_

@@ -61,7 +61,7 @@ endif()
 # the path to the SDK), unless it's needed. The flag USE_HEXAGON decides
 # whether any Hexagon-related functionality is enabled. Specifically,
 # setting USE_HEXAGON=OFF, disables any form of Hexagon support.
-# 
+#
 # Note on the function of USE_HEXAGON_RPC:
 # - When building for Hexagon, this will build the Hexagon endpoint of the
 #   RPC server: the FastRPC skel library (with TVM runtime built into it),
@@ -84,13 +84,14 @@ if(NOT USE_HEXAGON)
   if(BUILD_FOR_HOST)
     list(APPEND COMPILER_SRCS src/target/opt/build_hexagon_off.cc)
   endif()
-  list(APPEND RUNTIME_SRCS src/runtime/hexagon/hexagon/hexagon_buffer.cc)
-  list(APPEND RUNTIME_SRCS src/runtime/hexagon/hexagon/hexagon_common.cc)
-  list(APPEND RUNTIME_SRCS src/runtime/hexagon/hexagon/hexagon_user_dma.cc)
   return()
 endif()
 
 # From here on, USE_HEXAGON is assumed to be TRUE.
+
+if(BUILD_FOR_HOST AND USE_HEXAGON_QHL)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_QHL")
+endif()
 
 function(add_android_paths)
   get_hexagon_sdk_property("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}"
@@ -119,16 +120,26 @@ function(add_hexagon_wrapper_paths)
   link_directories("${HEXAGON_TOOLCHAIN}/lib/iss")
 endfunction()
 
-
-# Common sources for TVM runtime with Hexagon support
-file_glob_append(RUNTIME_HEXAGON_SRCS
-  "${TVMRT_SOURCE_DIR}/hexagon/hexagon_module.cc"
-  "${TVMRT_SOURCE_DIR}/hexagon/hexagon/*.cc"
-  "${TVMRT_SOURCE_DIR}/hexagon/host/*.cc"
-)
-
+if(BUILD_FOR_HEXAGON)
+  # Common sources for TVM runtime with Hexagon support
+  file_glob_append(RUNTIME_HEXAGON_SRCS
+    "${TVMRT_SOURCE_DIR}/hexagon/*.cc"
+  )
+  # Add builtins to RelaxVM
+  tvm_file_glob(GLOB RELAX_VM_BUILTIN_SRC_CC src/runtime/relax_vm/hexagon/*.cc)
+  list(APPEND RUNTIME_SRCS ${RELAX_VM_BUILTIN_SRC_CC})
+else()
+  file_glob_append(RUNTIME_HEXAGON_SRCS
+    "${TVMRT_SOURCE_DIR}/hexagon/hexagon_module.cc"
+  )
+endif()
 
 if(BUILD_FOR_HEXAGON)
+  if(DEFINED USE_HEXAGON_GTEST AND EXISTS ${USE_HEXAGON_GTEST})
+    file_glob_append(RUNTIME_HEXAGON_SRCS
+      "${CMAKE_SOURCE_DIR}/tests/cpp-runtime/hexagon/*.cc"
+    )
+  endif()
   get_hexagon_sdk_property("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}"
     SDK_INCLUDE   SDK_INCLUDE_DIRS
     QURT_INCLUDE  QURT_INCLUDE_DIRS
@@ -144,8 +155,83 @@ if(BUILD_FOR_HEXAGON)
   include_directories(SYSTEM ${SDK_INCLUDE_DIRS} ${QURT_INCLUDE_DIRS})
 
   set(USE_CUSTOM_LOGGING ON) # To use a custom logger
-endif()
 
+# QHL support.
+  if(USE_HEXAGON_QHL)
+    file_glob_append(TVM_QHL_WRAPPER_SRCS
+      "${TVMRT_SOURCE_DIR}/hexagon/qhl/*.cc"
+    )
+
+    include_directories(
+      "${USE_HEXAGON_SDK}/libs/qhl_hvx/inc/qhmath_hvx"
+      "${USE_HEXAGON_SDK}/libs/qhl_hvx/inc/internal/"
+
+      "${USE_HEXAGON_SDK}/libs/qhl/inc/qhmath"
+      "${USE_HEXAGON_SDK}/libs/qhl/src/internal/"
+      )
+    set_property(SOURCE ${TVM_QHL_WRAPPER_SRCS} APPEND_STRING  PROPERTY COMPILE_FLAGS "-Wno-narrowing -mhvx -mhvx-length=128B")
+
+    list(APPEND TVM_RUNTIME_LINKER_LIBS -Wl,--whole-archive ${USE_HEXAGON_SDK}/libs/qhl_hvx/prebuilt/hexagon_toolv84_v68/libqhmath_hvx.a -Wl,--no-whole-archive)
+    list(APPEND TVM_RUNTIME_LINKER_LIBS -Wl,--whole-archive ${USE_HEXAGON_SDK}/libs/qhl/prebuilt/hexagon_toolv84_v68/libqhmath.a -Wl,--no-whole-archive)
+
+  endif()
+
+  # Hand-written ops
+  file_glob_append(RUNTIME_HEXAGON_SRCS
+    "${TVMRT_SOURCE_DIR}/hexagon/ops/*.cc"
+  )
+
+  include_directories(
+    "${TVMRT_SOURCE_DIR}/hexagon/ops"
+  )
+
+  set_source_files_properties(
+    "${TVMRT_SOURCE_DIR}/hexagon/ops/conv2d_quant_hvx.cc"
+    PROPERTIES COMPILE_FLAGS "-mhvx"
+  )
+
+  set_source_files_properties(
+    "${TVMRT_SOURCE_DIR}/hexagon/ops/conv2d_fp16_hvx.cc"
+    PROPERTIES COMPILE_FLAGS "-mhvx"
+  )
+
+  # Include hexagon external library runtime sources
+  if(USE_HEXAGON_EXTERNAL_LIBS)
+    # Check if the libs are provided as an absolute path
+    if (EXISTS ${USE_HEXAGON_EXTERNAL_LIBS})
+    # Check if the libs are provided as a git url
+    elseif(USE_HEXAGON_EXTERNAL_LIBS MATCHES "\.git$")
+      if (NOT DEFINED HEXAGON_EXTERNAL_LIBS_SHA)
+        message(FATAL_ERROR "HEXAGON_EXTERNA_LIBS_SHA must be set when "
+          "USE_HEXAGON_EXTERNAL_LIBS is set to a git repository")
+      endif()
+      include(FetchContent)
+      FetchContent_Declare(hexagon_external
+        GIT_REPOSITORY "${USE_HEXAGON_EXTERNAL_LIBS}"
+        GIT_TAG "${HEXAGON_EXTERNAL_LIBS_SHA}")
+      FetchContent_MakeAvailable(hexagon_external)
+      set(USE_HEXAGON_EXTERNAL_LIBS "${hexagon_external_SOURCE_DIR}")
+    else()
+      message(FATAL_ERROR "Invalid use of USE_HEXAGON_EXTERNAL_LIBS="
+        "${USE_HEXAGON_EXTERNAL_LIBS}; USE_HEXAGON_EXTERNAL_LIBS only "
+        "supports absolute paths and git repository urls")
+    endif()
+
+    file_glob_append(HEXAGON_EXTERNAL_RUNTIME_SRCS
+      "${USE_HEXAGON_EXTERNAL_LIBS}/src/runtime/hexagon/*.cc"
+    )
+    list(APPEND RUNTIME_HEXAGON_SRCS "${HEXAGON_EXTERNAL_RUNTIME_SRCS}")
+    if (EXISTS "${USE_HEXAGON_EXTERNAL_LIBS}/HexagonExternalCompileFlags.cmake")
+      # External libraries will define HEXAGON_EXTERNAL_LIBS_COMPILE_FLAGS,
+      # changing this variable name will break downstream external libraries.
+      include("${USE_HEXAGON_EXTERNAL_LIBS}/HexagonExternalCompileFlags.cmake")
+      set_source_files_properties(
+        "${HEXAGON_EXTERNAL_RUNTIME_SRCS}"
+        PROPERTIES COMPILE_FLAGS "${HEXAGON_EXTERNAL_LIBS_COMPILE_FLAGS}"
+        )
+    endif()
+  endif()
+endif()
 
 if(USE_HEXAGON_RPC)
   function(build_rpc_idl)
@@ -168,6 +254,14 @@ if(USE_HEXAGON_RPC)
           -o "${TVMRT_SOURCE_DIR}/hexagon/rpc"
       MAIN_DEPENDENCY "${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon_rpc.idl"
     )
+
+    if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
+        # We can't easily fix this at the source-code level, because the .c file is generated
+        # by the qaic program.  But it should be safe to ignore the warning:
+        # https://stackoverflow.com/questions/13905200/is-it-wise-to-ignore-gcc-clangs-wmissing-braces-warning
+        set_source_files_properties("${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon_rpc_stub.c"
+            PROPERTY COMPILE_FLAGS "-Wno-missing-braces")
+    endif()
   endfunction()
 
   if(BUILD_FOR_ANDROID)
@@ -199,10 +293,14 @@ if(USE_HEXAGON_RPC)
       # TODO(masahi): Remove rpc_local_session.cc after verifying that things work without it
       "${TVMRT_SOURCE_DIR}/rpc/rpc_local_session.cc"
     )
+    set(HEXAGON_PROFILER_DIR "${TVMRT_SOURCE_DIR}/hexagon/profiler")
     # Add the hardware-specific RPC code into the skel library.
+    set_property(SOURCE ${HEXAGON_PROFILER_DIR}/lwp_handler.S PROPERTY LANGUAGE C)
     add_library(hexagon_rpc_skel SHARED
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon/rpc_server.cc"
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/hexagon_rpc_skel.c"
+      "${HEXAGON_PROFILER_DIR}/prof_utils.cc"
+      "${HEXAGON_PROFILER_DIR}/lwp_handler.S"
     )
     target_include_directories(hexagon_rpc_skel
       SYSTEM PRIVATE "${TVMRT_SOURCE_DIR}/hexagon/rpc"
@@ -211,6 +309,8 @@ if(USE_HEXAGON_RPC)
     # executed via run_main_on_sim.
     add_library(hexagon_rpc_sim SHARED
       "${TVMRT_SOURCE_DIR}/hexagon/rpc/simulator/rpc_server.cc"
+      "${HEXAGON_PROFILER_DIR}/prof_utils.cc"
+      "${HEXAGON_PROFILER_DIR}/lwp_handler.S"
     )
     target_link_libraries(hexagon_rpc_sim
       -Wl,--whole-archive tvm_runtime -Wl,--no-whole-archive
@@ -226,5 +326,4 @@ if(USE_HEXAGON_RPC)
   endif()
 endif()   # USE_HEXAGON_RPC
 
-
-list(APPEND RUNTIME_SRCS ${RUNTIME_HEXAGON_SRCS})
+list(APPEND RUNTIME_SRCS ${RUNTIME_HEXAGON_SRCS} ${TVM_QHL_WRAPPER_SRCS})

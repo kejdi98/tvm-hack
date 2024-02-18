@@ -22,6 +22,7 @@
  * \file cross_thread_reduction.cc
  */
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include "compute_op.h"
 #include "op_utils.h"
@@ -62,7 +63,7 @@ using namespace tir;
 // The last step is to write the final reduction variable,
 // which should be predicated by the existing input_pred if any
 // The consequence is that input_pred should be independent of
-// the reduction axis. Otherwise, we need to seperate it into
+// the reduction axis. Otherwise, we need to separate it into
 // dependent part and independent one.
 //
 // (3) write back
@@ -180,20 +181,21 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
     freduce_args.push_back(dummy_load);
   }
 
+  // Checks for the thread.
+  std::vector<PrimExpr> output_preds;
+  if (stage->store_predicate.defined()) {
+    output_preds.emplace_back(stage->store_predicate);
+  }
+
   for (IterVar iv : stage->leaf_iter_vars) {
     if (iv->iter_type == kCommReduce) {
       auto it = stage->iter_var_attrs.find(iv);
       if (it != stage->iter_var_attrs.end() && (*it).second->bind_thread.defined()) {
         IterVar tv = (*it).second->bind_thread;
         freduce_args.push_back(tv->var);
+        output_preds.push_back(tv->var == make_const(tv->var->dtype, 0));
       }
     }
-  }
-
-  // Checks for the thread.
-  std::vector<PrimExpr> output_preds;
-  if (stage->store_predicate.defined()) {
-    output_preds.emplace_back(stage->store_predicate);
   }
 
   // Apply the existing input predicate if any.

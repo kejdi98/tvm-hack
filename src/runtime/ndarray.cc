@@ -181,7 +181,30 @@ struct NDArray::Internal {
 
 NDArray NDArray::CreateView(ShapeTuple shape, DLDataType dtype) {
   ICHECK(data_ != nullptr);
-  ICHECK(get_mutable()->dl_tensor.strides == nullptr) << "Can only create view for compact tensor";
+
+  const DLTensor& orig = get_mutable()->dl_tensor;
+  ICHECK(IsContiguous()) << "Can only create view for compact tensor, but found strides " <<
+      [&orig]() {
+        std::stringstream ss;
+        ss << "[";
+        for (int i = 0; i < orig.ndim; i++) {
+          if (i) ss << ", ";
+          ss << orig.strides[i];
+        }
+        ss << "]";
+        return ss.str();
+      }() << ", for shape "
+                         << [&]() {
+                              std::stringstream ss;
+                              ss << "[";
+                              for (int i = 0; i < orig.ndim; i++) {
+                                if (i) ss << ", ";
+                                ss << orig.shape[i];
+                              }
+                              ss << "]";
+                              return ss.str();
+                            }();
+
   NDArray ret = Internal::Create(shape, dtype, get_mutable()->dl_tensor.device);
   ret.get_mutable()->dl_tensor.byte_offset = this->get_mutable()->dl_tensor.byte_offset;
   size_t curr_size = GetDataSize(this->get_mutable()->dl_tensor);
@@ -206,6 +229,8 @@ NDArray NDArray::Empty(ShapeTuple shape, DLDataType dtype, Device dev, Optional<
 }
 
 NDArray NDArray::FromExternalDLTensor(const DLTensor& dl_tensor) {
+  ICHECK(::tvm::runtime::IsContiguous(dl_tensor)) << "External DLTensor must be contiguous.";
+  ICHECK(IsAligned(dl_tensor)) << "Data in DLTensor is not aligned as required by NDArray";
   NDArray::Container* data = new NDArray::Container();
 
   data->SetDeleter(Internal::SelfDeleter);
@@ -219,7 +244,9 @@ NDArray NDArray::FromExternalDLTensor(const DLTensor& dl_tensor) {
   return NDArray(GetObjectPtr<Object>(data));
 }
 
-NDArray NDArray::NewFromDLTensor(DLTensor* tensor, Device dev) {
+NDArray NDArray::NewFromDLTensor(DLTensor* tensor, const Device& dev) {
+  ICHECK(::tvm::runtime::IsContiguous(*tensor))
+      << "DLTensor is not contiguous. Copying from non-contiguous data is currently not supported";
   std::vector<int64_t> shape;
   for (int64_t i = 0; i < tensor->ndim; i++) {
     shape.push_back(tensor->shape[i]);
@@ -235,6 +262,9 @@ NDArray NDArray::FromDLPack(DLManagedTensor* tensor) {
   data->SetDeleter(Internal::DLPackDeleter);
   // fill up content.
   data->manager_ctx = tensor;
+  ICHECK(::tvm::runtime::IsContiguous(tensor->dl_tensor)) << "DLManagedTensor must be contiguous.";
+  ICHECK(IsAligned(tensor->dl_tensor))
+      << "Data in DLManagedTensor is not aligned as required by NDArray";
   data->dl_tensor = tensor->dl_tensor;
   // update shape_
   std::vector<ShapeTuple::index_type> shape;
@@ -260,7 +290,7 @@ void NDArray::CopyFromBytes(const void* data, size_t nbytes) {
 void NDArray::CopyFromTo(const DLTensor* from, DLTensor* to, TVMStreamHandle stream) {
   size_t from_size = GetDataSize(*from);
   size_t to_size = GetDataSize(*to);
-  ICHECK_EQ(from_size, to_size) << "TVMArrayCopyFromTo: The size must exactly match";
+  ICHECK_EQ(from_size, to_size) << "TVMArrayCopyFromTo: The size in bytes must exactly match.";
 
   ICHECK(from->device.device_type == to->device.device_type || from->device.device_type == kDLCPU ||
          to->device.device_type == kDLCPU || from->device.device_type == kDLCUDAHost ||
@@ -275,9 +305,25 @@ void NDArray::CopyFromTo(const DLTensor* from, DLTensor* to, TVMStreamHandle str
   DeviceAPI::Get(dev)->CopyDataFromTo(const_cast<DLTensor*>(from), to, stream);
 }
 
-ShapeTuple NDArray::Shape() const { return get_mutable()->shape_; }
+ShapeTuple NDArray::Shape() const {
+  return static_cast<const NDArray::Container*>(data_.get())->shape_;
+}
+
 runtime::DataType NDArray::DataType() const {
   return runtime::DataType(get_mutable()->dl_tensor.dtype);
+}
+
+bool NDArray::AbilityOfZeroCopyForDLTensor(DLTensor* tensor, const Device& dev) {
+  bool device_check = (dev.device_type == tensor->device.device_type);
+  bool device_id_check = (dev.device_id == tensor->device.device_id);
+  bool alignment_check = IsAligned(*tensor);
+  return device_check && device_id_check && alignment_check;
+}
+
+bool NDArray::IsAligned(const DLTensor& tensor) {
+  return (reinterpret_cast<size_t>(static_cast<char*>(tensor.data) + tensor.byte_offset) %
+              tvm::runtime::kAllocAlignment ==
+          0);
 }
 
 TVM_REGISTER_OBJECT_TYPE(NDArray::Container);

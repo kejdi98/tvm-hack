@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -x
+set -euxo pipefail
 
 echo "===== JENKINS INFO ====="
 echo "NODE_NAME=$NODE_NAME"
@@ -41,3 +41,4 @@ echo "===== RUNNER INFO ====="
 df --human-readable
 lscpu
 free
+nvidia-smi 2>/dev/null || echo "cuda not found"

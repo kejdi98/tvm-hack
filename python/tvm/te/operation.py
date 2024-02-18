@@ -15,17 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 """ Operation class for computation declaration."""
-# pylint: disable=invalid-name
-from numbers import Integral as _Integral
-from typing import List, Union
 import inspect
 
+# pylint: disable=invalid-name
+from numbers import Integral as _Integral
+from typing import List, Optional, Union
+
 import tvm._ffi
+import tvm.arith._ffi_api
+import tvm.tir
+import tvm.tir._ffi_api
 from tvm._ffi.base import string_types
 from tvm.ir import Array
 from tvm.runtime import convert
-import tvm.tir
-import tvm.tir._ffi_api
 
 from . import _ffi_api
 from . import tag as _tag
@@ -98,7 +100,7 @@ def compute(shape, fcompute, name="compute", tag="", attrs=None, varargs_names=N
 
     argspec = inspect.getfullargspec(fcompute)
     if len(argspec.args) == 0 and argspec.varargs is None:
-        arg_names = ["i%d" % i for i in range(out_ndim)]
+        arg_names = [f"i{i}" for i in range(out_ndim)]
     elif argspec.varargs is not None:
         # if there is a varargs, it takes the remaining dimensions of out_ndim
         num_remaining_args = out_ndim - len(argspec.args)
@@ -123,7 +125,7 @@ def compute(shape, fcompute, name="compute", tag="", attrs=None, varargs_names=N
     if out_ndim != len(arg_names):
         raise ValueError(
             "Number of args to fcompute does not match dimension, "
-            "args=%d, dimension=%d" % (len(arg_names), out_ndim)
+            f"args={len(arg_names)}, dimension={out_ndim}"
         )
 
     dim_var = [tvm.tir.IterVar((0, s), x, 0) for x, s in zip(arg_names, shape[:out_ndim])]
@@ -185,7 +187,7 @@ def scan(init, update, state_placeholder, inputs=None, name="scan", tag="", attr
     Returns
     -------
     tensor: Tensor or list of Tensors
-        The created tensor or tuple of tensors it it contains multiple outputs.
+        The created tensor or tuple of tensors contains multiple outputs.
 
     Example
     -------
@@ -216,7 +218,7 @@ def scan(init, update, state_placeholder, inputs=None, name="scan", tag="", attr
         inputs = []
     if len(init) != len(update) or len(init) != len(state_placeholder):
         raise ValueError("init, update, state_placeholder must have same length")
-    axis = tvm.tir.IterVar((init[0].shape[0], update[0].shape[0]), "%s.idx" % name, 3)
+    axis = tvm.tir.IterVar((init[0].shape[0], update[0].shape[0]), f"{name}.idx", 3)
     op = _ffi_api.ScanOp(name, tag, attrs, axis, init, update, state_placeholder, inputs)
     res = [op.output(i) for i in range(len(update))]
     return res[0] if len(res) == 1 else res
@@ -280,7 +282,7 @@ def extern(
     Returns
     -------
     tensor: Tensor or list of Tensors
-        The created tensor or tuple of tensors it it contains multiple outputs.
+        The created tensor or tuple of tensors contains multiple outputs.
 
     Example
     -------
@@ -324,7 +326,11 @@ def extern(
         if not isinstance(t, _tensor.Tensor):
             raise ValueError("expect inputs to be tensor")
         if in_buffers is None:
-            input_placeholders.append(tvm.tir.decl_buffer(t.shape, t.dtype, t.op.name))
+            input_placeholders.append(
+                tvm.tir.decl_buffer(
+                    t.shape, t.dtype, t.op.name, elem_offset=tvm.tir.Var("elem_offset", "int32")
+                )
+            )
         types.add(t.dtype)
 
     if dtype is None:
@@ -337,20 +343,105 @@ def extern(
 
     if out_buffers is None:
         for shp, dt in zip(shape, dtype):
-            output_placeholders.append(tvm.tir.decl_buffer(shp, dt, name))
+            output_placeholders.append(
+                tvm.tir.decl_buffer(shp, dt, name, elem_offset=tvm.tir.Var("elem_offset", "int32"))
+            )
     body = fcompute(input_placeholders, output_placeholders)
     if isinstance(body, tvm.tir.PrimExpr):
         body = tvm.tir.Evaluate(body)
     if not isinstance(body, tvm.tir.Stmt):
         raise ValueError(
-            "Function '{}' should return PrimExpr or Stmt, but it returned '{}'".format(
-                fcompute.__name__, type(body)
-            )
+            f"Function '{fcompute.__name__}' should return PrimExpr or Stmt, but it returned "
+            f"'{type(body)}'"
         )
 
     op = _ffi_api.ExternOp(name, tag, attrs, inputs, input_placeholders, output_placeholders, body)
     res = [op.output(i) for i in range(len(output_placeholders))]
     return res[0] if len(res) == 1 else res
+
+
+def extern_primfunc(input_tensors: List[_tensor.Tensor], primfunc: tvm.tir.PrimFunc, **kwargs):
+    """Compute tensors via a schedulable TIR PrimFunc
+
+    Parameters
+    ----------
+    input_tensors: list of Tensor
+        Input tensors that map to the corresponding primfunc input params.
+
+    primfunc: PrimFunc
+        The TIR PrimFunc
+
+    Returns
+    -------
+    tensor: Tensor or list of Tensors
+        The created tensor or tuple of tensors if it contains multiple outputs.
+
+    Example
+    -------
+    In the code below, a TVMScript defined TIR PrimFunc is inlined into
+    a TE ExternOp. Applying te.create_prim_func on this
+
+    .. code-block:: python
+
+        A = te.placeholder((128, 128), name="A")
+        B = te.placeholder((128, 128), name="B")
+
+        @T.prim_func
+        def before_split(a: T.handle, b: T.handle) -> None:
+            A = T.match_buffer(a, (128, 128))
+            B = T.match_buffer(b, (128, 128))
+            for i, j in T.grid(128, 128):
+                with T.block("B"):
+                    vi, vj = T.axis.remap("SS", [i, j])
+                    B[vi, vj] = A[vi, vj] * 2.0
+
+        C = te.extern_primfunc([A, B], func)
+    """
+
+    # dt_access_map and primfunc.buffer_map are unordered, so use order from primfunc.params
+    dt_access_map = tvm.arith._ffi_api.DomainTouchedAccessMap(primfunc)
+    ordered_buffers = [primfunc.buffer_map[param] for param in primfunc.params]
+    in_buffers = [buf for buf in ordered_buffers if len(dt_access_map[buf][0])]
+    out_buffers = [buf for buf in ordered_buffers if len(dt_access_map[buf][1])]
+    assert in_buffers, "PrimFunc has no input buffers"
+    assert out_buffers, "PrimFunc has no output buffers"
+
+    outputs = []
+    inplace = []
+    input_buffers = in_buffers
+    for obuf in out_buffers:
+        if obuf in in_buffers:
+            inplace.append(obuf)
+        else:
+            outputs.append(obuf)
+
+    if not outputs:
+        iobuf = inplace.pop()
+        input_buffers.remove(iobuf)
+        outputs = [iobuf]
+
+    assert len(input_buffers) == len(input_tensors), (
+        "The number of provided input input_tensors does not match the number of ",
+        "input buffers in the primfunc",
+    )
+    for tensor, buffer in zip(input_tensors, input_buffers):
+        # TODO(csullivan): Can a stronger comparison between Tensor<>Buffer be made?
+        assert len(tensor.shape) == len(buffer.shape)
+        for d1, d2 in zip(tensor.shape, buffer.shape):
+            assert d1 == d2, (
+                "The input input_tensors provided do not match the input buffers in the ",
+                "primfunc. Please check that the order of input te.Input_Tensors and the ",
+                "order of the primfunc variables in the params list agree.",
+            )
+    output = extern(
+        [buf.shape for buf in outputs],
+        input_tensors,
+        lambda ins, outs: primfunc.body,
+        in_buffers=input_buffers,
+        out_buffers=outputs,
+        **kwargs,
+    )
+    return output
 
 
 def var(name="tindex", dtype="int32", span=None):
@@ -375,13 +466,13 @@ def var(name="tindex", dtype="int32", span=None):
     return tvm.tir.Var(name, dtype, span)
 
 
-def const(dtype="int32", span=None):
-    """Create a new constant with specified name and dtype
+def const(value, dtype="int32", span=None):
+    """Create a new constant with specified value and dtype
 
     Parameters
     ----------
-    name : str
-        The name
+    value : Union[bool, int, float, numpy.ndarray, tvm.nd.NDArray]
+        The constant value.
 
     dtype : str
         The data type
@@ -391,10 +482,10 @@ def const(dtype="int32", span=None):
 
     Returns
     -------
-    var : Var
-        The result symbolic variable.
+    const : PrimExpr
+        The result constant expr.
     """
-    return tvm.tir.const(dtype, span)
+    return tvm.tir.const(value, dtype, span)
 
 
 def size_var(name="size", dtype="int32", span=None):
@@ -475,12 +566,14 @@ def reduce_axis(dom, name="rv", thread_tag="", span=None):
     return tvm.tir.IterVar(dom, name, 2, thread_tag, span)
 
 
-def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
+def create_prim_func(
+    ops: List[Union[_tensor.Tensor, tvm.tir.Var]], index_dtype_override: Optional[str] = None
+) -> tvm.tir.PrimFunc:
     """Create a TensorIR PrimFunc from tensor expression
 
     Parameters
     ----------
-    ops : List[Tensor]
+    ops : List[Union[_tensor.Tensor, tvm.tir.Var]]
         The source expression.
 
     Example
@@ -513,7 +606,7 @@ def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
             B = T.match_buffer(b, (128, 128))
             C = T.match_buffer(c, (128, 128))
 
-            for i, j, k in T.grip(128, 128, 128):
+            for i, j, k in T.grid(128, 128, 128):
                 with T.block():
                     vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                     with T.init():
@@ -527,24 +620,4 @@ def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
     """
     if not isinstance(ops, (list, tuple, Array)):
         ops = [ops]
-    return _ffi_api.CreatePrimFunc(ops)
-
-
-def create_prim_func_from_outputs(
-    outputs: Union[_tensor.Tensor, List[_tensor.Tensor]],
-) -> tvm.tir.PrimFunc:
-    """Create a TensorIR PrimFunc from output tensor(s) in TE
-
-    Parameters
-    ----------
-    outputs : Union[Tensor, List[Tensor]]
-        The source expression.
-
-    Returns
-    -------
-    func : tir.PrimFunc
-        The created function.
-    """
-    if not isinstance(outputs, (list, tuple, Array)):
-        outputs = [outputs]
-    return _ffi_api.CreatePrimFuncFromOutputs(outputs)
+    return _ffi_api.CreatePrimFunc(ops, index_dtype_override)

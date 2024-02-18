@@ -23,7 +23,7 @@ Auto-tuning for specific devices and workloads is critical for getting the
 best performance. This is a tutorial on how to tune a whole neural
 network for NVIDIA GPU with the auto-scheduler.
 
-To auto-tune a neural network, we partition the network into small subgraphs and 
+To auto-tune a neural network, we partition the network into small subgraphs and
 tune them independently. Each subgraph is treated as one search task.
 A task scheduler slices the time and dynamically allocates time resources to
 these tasks. The task scheduler predicts the impact of each task on the end-to-end
@@ -44,6 +44,7 @@ get it to run, you will need to wrap the body of this tutorial in a :code:`if
 __name__ == "__main__":` block.
 """
 
+import sys
 import numpy as np
 
 import tvm
@@ -113,20 +114,6 @@ def get_network(name, batch_size, layout="NHWC", dtype="float32"):
     elif name == "inception_v3":
         input_shape = (batch_size, 3, 299, 299) if layout == "NCHW" else (batch_size, 299, 299, 3)
         mod, params = relay.testing.inception_v3.get_workload(batch_size=batch_size, dtype=dtype)
-    elif name == "mxnet":
-        # an example for mxnet model
-        from mxnet.gluon.model_zoo.vision import get_model
-
-        assert layout == "NCHW"
-
-        block = get_model("resnet18_v1", pretrained=True)
-        mod, params = relay.frontend.from_mxnet(block, shape={"data": input_shape}, dtype=dtype)
-        net = mod["main"]
-        net = relay.Function(
-            net.params, relay.nn.softmax(net.body), None, net.type_params, net.attrs
-        )
-        mod = tvm.IRModule.from_expr(net)
-
     return mod, params, input_shape, output_shape
 
 
@@ -164,7 +151,7 @@ for idx, task in enumerate(tasks):
 # Now, we set some options for tuning and launch the search tasks
 #
 # * :code:`measure_ctx` launches a different process for measurement to
-#   provide isolation. It can protect the master process from GPU crashes
+#   provide isolation. It can protect the main process from GPU crashes
 #   during measurement and avoid other runtime conflicts.
 # * :code:`min_repeat_ms` defines the minimum duration of one "repeat" in every measurement.
 #   This can warmup the GPU, which is necessary to get accurate measurement results.

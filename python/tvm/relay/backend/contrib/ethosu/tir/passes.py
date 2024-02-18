@@ -14,13 +14,18 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=invalid-name, unused-argument, no-else-return, inconsistent-return-statements
+# pylint: disable=invalid-name, unused-argument, no-else-return
+# pylint: disable=use-list-literal, inconsistent-return-statements, too-many-nested-blocks
 """The TIR passes to be run on Arm(R) Ethos(TM)-U NPU TIR Compiler."""
 from collections import namedtuple
+from typing import Optional
 import numpy as np  # type: ignore
+from ethosu.vela import api as vapi  # type: ignore
 
 import tvm
 from tvm.relay.backend.contrib.ethosu import vela_api
+from tvm.relay.backend.contrib.ethosu import tir_to_cs_translator as tirtocs
+
 from .convolution import get_conv2d_params
 from .depthwise import get_depthwise_conv2d_params
 from .pooling import get_pooling_params
@@ -28,7 +33,7 @@ from .binary_elementwise import get_binary_elementwise_params
 from .identity import get_identity_params
 from .unary_elementwise import get_unary_elementwise_params
 from .transform import get_copy_params
-from .utils import get_weights_buffer, get_scale_bias_buffer
+from .producers_consumers import ProducersConsumers
 
 from .. import _ffi_api
 
@@ -46,7 +51,7 @@ def RemoveZeroStores():
 
     def _ftransform(f, mod, ctx):
         return f.with_body(
-            tvm.tir.stmt_functor.ir_transform(f.body, _remove_zero_store, None, ["tir.Store"])
+            tvm.tir.stmt_functor.ir_transform(f.body, _remove_zero_store, None, ["tir.BufferStore"])
         )
 
     return tvm.tir.transform.prim_func_pass(
@@ -66,12 +71,16 @@ def ReplaceOperators():
         "ethosu_identity": get_identity_params,
         "ethosu_unary_elementwise": get_unary_elementwise_params,
     }
-    pointer_to_producer = {}
-    pointer_to_consumer = {}
+    producers_consumers = ProducersConsumers()
     replace_output_pointer = {}
     pointer_to_extents = {}
+    replaced_pointers = []
 
     ReplaceInfo = namedtuple("ReplaceInfo", ["pointer", "reallocate"])
+
+    def _find_pointer_to_extent(stmt):
+        if isinstance(stmt, tvm.tir.Allocate):
+            pointer_to_extents[stmt.buffer_var] = stmt.extents
 
     def _resolve_pointers(stmt):
         """This pass determines information about the pointers present in the IR.
@@ -87,17 +96,22 @@ def ReplaceOperators():
             if isinstance(stmt, tvm.tir.BufferLoad):
                 loads.append(stmt.buffer.data)
 
-        if isinstance(stmt, tvm.tir.Allocate):
-            pointer_to_extents[stmt.buffer_var] = stmt.extents
-            if isinstance(stmt.body[0], tvm.tir.AttrStmt):
-                if stmt.body[0].attr_key == "pragma_op":
-                    pointer_to_producer[stmt.buffer_var] = stmt.body[0]
+        buffer_var = None
 
-        elif isinstance(stmt, tvm.tir.AttrStmt):
+        def _get_buffer_var(stmt):
+            if isinstance(stmt, tvm.tir.BufferStore):
+                nonlocal buffer_var
+                buffer_var = stmt.buffer.data
+
+        if isinstance(stmt, tvm.tir.AttrStmt):
             if stmt.attr_key == "pragma_op":
+                tvm.tir.stmt_functor.post_order_visit(stmt, _get_buffer_var)
+                producers_consumers.add_producer(buffer_var, stmt)
+
                 tvm.tir.stmt_functor.post_order_visit(stmt, _get_loads)
                 for load_pointer in loads:
-                    pointer_to_consumer[load_pointer] = stmt
+                    if load_pointer != buffer_var:
+                        producers_consumers.add_consumer(load_pointer, stmt)
 
     def _replace_operator(stmt):
         """Replace operators with call_externs, having derived the parameters
@@ -122,12 +136,16 @@ def ReplaceOperators():
                 # Get the parameters for the extern call
                 param_func = op_map[op_name]
                 info, output_pointer, replace_pointer, is_allocator = param_func(
-                    stmt, pointer_to_producer, pointer_to_consumer
+                    stmt, producers_consumers
                 )
                 if replace_pointer is not None:
+                    # Allocate pointer only once
+                    if replace_pointer in replaced_pointers:
+                        is_allocator = False
                     replace_output_pointer[output_pointer] = ReplaceInfo(
                         replace_pointer, is_allocator
                     )
+                    replaced_pointers.append(replace_pointer)
                 # Make the extern call
                 irb = tvm.tir.ir_builder.create()
                 irb.emit(tvm.tir.call_extern("handle", op_name, *info))
@@ -141,42 +159,25 @@ def ReplaceOperators():
         independently but instead get compiled into the operator they're associated with,
         e.g. a conv2d.
 
-        There are potentially 3 parts to remove for an operator: the memory scope, the
-        allocate for its output and the compute nest itself. For the memory scope and
+        There are potentially 2 parts to remove for an operator:
+        the allocate for its output and the compute nest itself. For the
         allocate, we can check if the pointer they reference is produced by a 'no compile'
         operator. For the compute nest, we can just check the op pragma."""
         if isinstance(stmt, tvm.tir.AttrStmt):
-            # Remove memory scopes
-            if stmt.node in pointer_to_producer:
-                producer_attr = pointer_to_producer[stmt.node]
-                if (
-                    producer_attr.attr_key == "pragma_op"
-                    and producer_attr.value.value not in op_map
-                ):
-                    return stmt.body
-
             # Remove compute nests
             if stmt.attr_key == "pragma_op" and stmt.value.value not in op_map:
                 return tvm.tir.Evaluate(0)
 
         if isinstance(stmt, tvm.tir.Allocate):
             # Remove allocates
-            if stmt.buffer_var in pointer_to_producer:
-                op_attr = pointer_to_producer[stmt.buffer_var]
-                if op_attr.attr_key == "pragma_op" and op_attr.value.value not in op_map:
+            producer = producers_consumers.get_last_producer(stmt.buffer_var)
+            if producer:
+                if producer.attr_key == "pragma_op" and producer.value.value not in op_map:
                     return stmt.body
+
         return None
 
     def _replace_pointers(stmt):
-        if isinstance(stmt, tvm.tir.AttrStmt):
-            # If the attribute references a pointer that needs replacing
-            if stmt.node in replace_output_pointer:
-                replace_pointer, reallocate = replace_output_pointer[stmt.node]
-                if not reallocate:
-                    return stmt.body
-                # Otherwise, rewrite the memory scope attribute with the new pointer
-                return tvm.tir.AttrStmt(replace_pointer, stmt.attr_key, stmt.value, stmt.body)
-
         if isinstance(stmt, tvm.tir.Allocate):
             # If the allocate allocates a pointer that needs replacing
             if stmt.buffer_var in replace_output_pointer:
@@ -192,16 +193,28 @@ def ReplaceOperators():
                 )
         return None
 
+    def _remove_buffer_decl(stmt):
+        if isinstance(stmt, tvm.tir.DeclBuffer):
+            if stmt.buffer.data in replace_output_pointer:
+                return stmt.body
+
     def _post_transform(stmt):
         # Replace operators with call_externs
         result = _replace_operator(stmt)
         # Remove operators that don't need compiling
         result = result or _remove_no_compile(stmt)
         # Replace necessary pointers that were removed in the previous step
-        return result or _replace_pointers(stmt)
+        result = result or _replace_pointers(stmt)
+        # Replace BufferDecl, since only the tir.Var data pointer is
+        # still used, and not the tir.Buffer
+        result = result or _remove_buffer_decl(stmt)
+
+        return result
 
     def _ftransform(f, mod, ctx):
+        tvm.tir.stmt_functor.post_order_visit(f.body, _find_pointer_to_extent)
         tvm.tir.stmt_functor.post_order_visit(f.body, _resolve_pointers)
+        producers_consumers.add_allocate_variables(pointer_to_extents.keys())
         return f.with_body(
             tvm.tir.stmt_functor.ir_transform(
                 f.body, None, _post_transform, ["tir.AttrStmt", "tir.Allocate"]
@@ -233,20 +246,35 @@ def DivideConstants(const_dict):
 
     def _visit(stmt):
         new_args = []
+        # We don't want to divide the constant that will be executed on two cores in parallel
+        is_u65_conv2d = (
+            vela_api.get_accelerator_config() == vapi.NpuAccelerator.Ethos_U65_512
+            and stmt.args[0] == "ethosu_conv2d"
+        )
         for i, arg in enumerate(stmt.args):
             if isinstance(arg, tvm.tir.expr.BufferLoad):
                 # If we're trying to load a buffer that maps to a constant
                 if arg.buffer.data in buffer_to_const:
                     const = buffer_to_const[arg.buffer.data]
-
-                    assert len(arg.indices) == 1, "Ethos-U passes expects flattened buffers"
+                    flattened_const_shape = np.prod(const.shape)
 
                     offset = int(arg.indices[0])
                     # Note by convention the arg after a constant read is the length of the read
                     length = int(stmt.args[i + 1])
                     # If it's anything other than a full read, create a new buffer
-                    if offset != 0 or len(const) != length:
-                        new_consts.append(const[offset : offset + length])
+                    if (
+                        offset != 0 or flattened_const_shape != length and length > 0
+                    ) and not is_u65_conv2d:
+                        out_channels = const.shape[0]
+                        offset_channels = int((offset * out_channels) / flattened_const_shape)
+                        length_channels = int((length * out_channels) / flattened_const_shape)
+                        # split the constant up across channels
+                        split_const = np.split(const, out_channels, axis=0)
+                        # create a new const out of the channels we want to keep
+                        new_const = np.concatenate(
+                            split_const[offset_channels : offset_channels + length_channels], axis=0
+                        )
+                        new_consts.append(new_const)
                         new_buffer = tvm.tir.decl_buffer(
                             (length,), arg.dtype, scope=arg.buffer.scope()
                         )
@@ -262,8 +290,8 @@ def DivideConstants(const_dict):
     def _ftransform(f, mod, ctx):
         for i, param in enumerate(f.params):
             if i in const_dict:
-                buffer_to_const[param] = const_dict[i].flatten()
-                buffer_to_const[f.buffer_map[param].data] = const_dict[i].flatten()
+                buffer_to_const[param] = const_dict[i]
+                buffer_to_const[f.buffer_map[param].data] = const_dict[i]
 
         new_body = tvm.tir.stmt_functor.ir_transform(f.body, _visit, None, ["tir.Call"])
         # Both the params and buffer map need updating for the newly introduced buffers
@@ -290,7 +318,6 @@ def DivideConstants(const_dict):
             new_body,
             f.ret_type,
             new_buffer_map,
-            f.preflattened_buffer_map,
             f.attrs,
             f.span,
         )
@@ -318,7 +345,7 @@ def EncodeConstants(const_dict):
     """
     new_const_dict = {}
 
-    def collect_encoding_definitions(stmt, old_buffer_to_const):
+    def collect_encoding_definitions(stmt, old_buffer_var_to_const):
         # Map from copy destination to copy source.
         copy_map = {}
         # List of buffer copies that occurred
@@ -345,7 +372,7 @@ def EncodeConstants(const_dict):
             value = np.frombuffer(value_bytes, dtype="uint8")
             return value
 
-        def _declare_constant_buffer(old_buffer, encoded_constants):
+        def _declare_constant_buffer(old_buffer, encoded_constants, split_idx):
             """Create a new buffer and add the old buffer and its pointer to the
             rewriting maps."""
             new_buffer = tvm.tir.decl_buffer(
@@ -360,14 +387,47 @@ def EncodeConstants(const_dict):
                     "old_buffer": old_buffer,
                     "new_buffer": new_buffer,
                     "encoded_constants": encoded_constants,
+                    "split_idx": split_idx,
                 }
             )
 
+        def _encode_weights_or_bias(buffer1, buffer2, stmt, encode_func):
+            """Encode the weights or align the bias either for one or two cores,
+            depending on the variant."""
+            constant = old_buffer_var_to_const[buffer1.data]
+
+            # If we have just one core, encode the whole constant
+            if buffer2 is None:
+                new_const = encode_func(stmt, constant)
+                return new_const, None
+
+            # Assume that the constant tensor has not been flattened yet
+            assert len(constant.shape) != 1
+            channels = constant.shape[0]
+            split_const = np.split(constant, channels, axis=0)
+
+            const_list = [split_const[i] for i in range(channels) if i % 2 == 0]
+            const_to_encode = np.concatenate(const_list, axis=0)
+
+            new_const = encode_func(stmt, const_to_encode)
+            split_idx = len(new_const)
+
+            # Encode half of the constant separately for the other core if it exists
+            assert buffer1.same_as(buffer2)
+            const2_list = [split_const[i] for i in range(channels) if i % 2 == 1]
+            const2_to_encode = np.concatenate(const2_list, axis=0)
+
+            new_const2 = encode_func(stmt, const2_to_encode)
+            new_const = np.append(new_const, new_const2).astype("uint8")
+
+            return new_const, split_idx
+
         def _visit(stmt):
             if isinstance(stmt, tvm.tir.Call):
+                op = str(stmt.args[0].value)
                 # Handle copies as a special-case by propagating the buffer information
                 # from the read to the write pointer.
-                if stmt.args[0] == "ethosu_copy":
+                if op == "ethosu_copy":
                     read_buffer = stmt.args[1].buffer
                     write_buffer = stmt.args[3].buffer
                     # Assert writing to the base of the write_var (pre-StorageRewrite)
@@ -376,24 +436,50 @@ def EncodeConstants(const_dict):
                     copied_buffers.append({"source": read_buffer, "dest": write_buffer})
                     copy_map[write_buffer] = read_buffer
 
-                else:
+                ops_with_weights = {
+                    "ethosu_conv2d": tirtocs.translate_ethosu_conv2d,
+                    "ethosu_depthwise_conv2d": tirtocs.translate_ethosu_depthwise_conv2d,
+                }
+                if op in ops_with_weights:
+                    npu_op, _ = ops_with_weights[op](stmt)
+
                     # Encode the weights
-                    weights_buffer = get_weights_buffer(stmt)
-                    if weights_buffer is not None:
-                        if weights_buffer in copy_map:
-                            weights_buffer = copy_map[weights_buffer]
-                        unencoded_weights_value = old_buffer_to_const[weights_buffer]
-                        encoded_weights_value = _encode_weights(stmt, unencoded_weights_value)
-                        _declare_constant_buffer(weights_buffer, encoded_weights_value)
+                    weights_buffer = npu_op.weights[0].address.buffer
+                    if weights_buffer in copy_map:
+                        weights_buffer = copy_map[weights_buffer]
+
+                    # In case of U65 512 mac variant the weights are split across two cores
+                    # and need to be encoded separately
+                    weights2_buffer = (
+                        npu_op.weights[1].address.buffer
+                        if accel_config == vapi.NpuAccelerator.Ethos_U65_512
+                        else None
+                    )
+                    if weights2_buffer in copy_map:
+                        weights2_buffer = copy_map[weights2_buffer]
+
+                    new_weights, split_idx = _encode_weights_or_bias(
+                        weights_buffer, weights2_buffer, stmt, _encode_weights
+                    )
+                    _declare_constant_buffer(weights_buffer, new_weights, split_idx)
 
                     # Align the scale_bias to 16 bytes
-                    scale_bias_buffer = get_scale_bias_buffer(stmt)
-                    if scale_bias_buffer is not None:
-                        if scale_bias_buffer in copy_map:
-                            scale_bias_buffer = copy_map[scale_bias_buffer]
-                        scale_bias_value = old_buffer_to_const[scale_bias_buffer]
-                        aligned_scale_bias_value = _align_scale_bias(stmt, scale_bias_value)
-                        _declare_constant_buffer(scale_bias_buffer, aligned_scale_bias_value)
+                    scale_bias_buffer = npu_op.biases[0].address.buffer
+                    if scale_bias_buffer in copy_map:
+                        scale_bias_buffer = copy_map[scale_bias_buffer]
+                    scale_bias2_buffer = (
+                        npu_op.biases[1].address.buffer
+                        if accel_config == vapi.NpuAccelerator.Ethos_U65_512
+                        else None
+                    )
+                    if scale_bias2_buffer in copy_map:
+                        scale_bias2_buffer = copy_map[scale_bias2_buffer]
+
+                    new_scale_bias, split_idx = _encode_weights_or_bias(
+                        scale_bias_buffer, scale_bias2_buffer, stmt, _align_scale_bias
+                    )
+
+                    _declare_constant_buffer(scale_bias_buffer, new_scale_bias, split_idx)
 
         tvm.tir.stmt_functor.post_order_visit(stmt, _visit)
 
@@ -402,7 +488,14 @@ def EncodeConstants(const_dict):
             "constant_buffer_replacements": constant_buffer_replacements,
         }
 
-    def transform_stmt(stmt, buf_remap, var_remap, pointer_to_buffer, new_buffer_to_const):
+    def transform_stmt(
+        stmt,
+        buf_remap,
+        var_remap,
+        pointer_to_buffer,
+        new_buffer_var_to_const,
+        new_buffer_to_split_idx,
+    ):
         def _visit_rewrite(stmt):
             if isinstance(stmt, tvm.tir.Call):
                 # For extern calls, we need to rewrite pairs of arguments corresponding to
@@ -415,9 +508,21 @@ def EncodeConstants(const_dict):
                     # encoded buffer, the current should be a length.
                     if (
                         isinstance(prev_arg, tvm.tir.BufferLoad)
-                        and prev_arg.buffer in new_buffer_to_const
+                        and prev_arg.buffer.data in new_buffer_var_to_const
                     ):
-                        arg = np.prod(list(prev_arg.buffer.shape))
+                        buffer_size = np.prod(list(prev_arg.buffer.shape))
+                        arg = buffer_size
+                        # We have to check for split weights/bias for conv2d and depthwise_conv2d
+                        if old_args[0] in ("ethosu_conv2d", "depthwise_conv2d"):
+                            # We have split weights/bias
+                            if prev_arg.buffer in new_buffer_to_split_idx:
+                                split_idx = new_buffer_to_split_idx[prev_arg.buffer]
+                                # The first half of the split buffer
+                                if prev_arg.indices[0] == 0:
+                                    arg = split_idx
+                                # the second half of the split buffer
+                                else:
+                                    arg = buffer_size - split_idx
 
                     new_args.append(arg)
 
@@ -445,7 +550,12 @@ def EncodeConstants(const_dict):
             # rewrite the nodes which contain the Buffers.
             if isinstance(stmt, tvm.tir.BufferLoad):
                 if stmt.buffer in buf_remap:
-                    return tvm.tir.BufferLoad(buf_remap[stmt.buffer], stmt.indices, stmt.span)
+                    new_buffer = buf_remap[stmt.buffer]
+                    new_indices = stmt.indices
+                    offset = new_indices[0]
+                    if offset != 0 and new_buffer in new_buffer_to_split_idx:
+                        offset = new_buffer_to_split_idx[new_buffer]
+                    return tvm.tir.BufferLoad(buf_remap[stmt.buffer], [offset], stmt.span)
 
             if isinstance(stmt, tvm.tir.AttrStmt):
                 node_pointer = stmt.node
@@ -467,27 +577,59 @@ def EncodeConstants(const_dict):
             ["tir.Call", "tir.Allocate", "tir.BufferLoad", "tir.AttrStmt"],
         )
 
+    def _collect_parameter_buffer_aliases(prim_func):
+        buffer_vars = {}
+        for param in prim_func.params:
+            if param in prim_func.buffer_map:
+                buf = prim_func.buffer_map[param]
+                buffer_vars[buf.data] = {buf}
+
+        def visit(node):
+            if isinstance(node, (tvm.tir.BufferStore, tvm.tir.BufferLoad, tvm.tir.DeclBuffer)):
+                buf = node.buffer
+                if buf.data in buffer_vars:
+                    buffer_vars[buf.data].add(buf)
+
+        tvm.tir.stmt_functor.post_order_visit(prim_func.body, visit)
+        return buffer_vars
+
     def _ftransform(f, mod, ctx):
+        param_buffer_var_usage = _collect_parameter_buffer_aliases(f)
+
         # Step 0: Unpack the constant dictionary in terms of the
         # functions buffers.
-        old_buffer_to_const = {}
+        old_buffer_var_to_const = {}
         for i, param in enumerate(f.params):
             if i in const_dict:
-                old_buffer_to_const[f.buffer_map[param]] = const_dict[i].flatten()
+                old_buffer_var_to_const[f.buffer_map[param].data] = const_dict[i]
 
         # Step 1: Collect information on the buffers that will be
         # replaced by encodings.
-        buffer_information = collect_encoding_definitions(f.body, old_buffer_to_const)
+        buffer_information = collect_encoding_definitions(f.body, old_buffer_var_to_const)
 
         # Step 2: Generate variable/buffer remaps, based on the
         # collected information.
         buf_remap = {}
-        new_buffer_to_const = {}
+        new_buffer_var_to_const = {}
+        new_buffer_to_split_idx = {}
+
+        def define_remap(old_buf, new_buf):
+            try:
+                old_buffers = param_buffer_var_usage[old_buf.data]
+            except KeyError:
+                old_buffers = [old_buf]
+
+            for old_buffer in old_buffers:
+                buf_remap[old_buffer] = new_buf
 
         # Any encoded buffers must be replaced
         for info in buffer_information["constant_buffer_replacements"]:
-            buf_remap[info["old_buffer"]] = info["new_buffer"]
-            new_buffer_to_const[info["new_buffer"]] = info["encoded_constants"]
+            define_remap(info["old_buffer"], info["new_buffer"])
+
+            new_buffer_var_to_const[info["new_buffer"].data] = info["encoded_constants"]
+
+            if info["split_idx"]:
+                new_buffer_to_split_idx[info["new_buffer"]] = info["split_idx"]
 
         # Any buffers that are copied into from an encoded buffer must
         # be replaced.
@@ -505,9 +647,14 @@ def EncodeConstants(const_dict):
                     name=copy_dest.name,
                     scope=copy_dest.scope(),
                 )
-                buf_remap[copy_dest] = new_dest
-                if copy_source in new_buffer_to_const:
-                    new_buffer_to_const[new_dest] = new_buffer_to_const[copy_source]
+                define_remap(copy_dest, new_dest)
+                if copy_source.data in new_buffer_var_to_const:
+                    new_buffer_var_to_const[new_dest.data] = new_buffer_var_to_const[
+                        copy_source.data
+                    ]
+
+                if copy_source in new_buffer_to_split_idx:
+                    new_buffer_to_split_idx[new_dest] = new_buffer_to_split_idx[copy_source]
 
         # Define additional dependent lookup tables.
         var_remap = {old.data: new.data for (old, new) in buf_remap.items()}
@@ -517,7 +664,12 @@ def EncodeConstants(const_dict):
 
         # Step 3: Then perform the rewrites
         new_body = transform_stmt(
-            f.body, buf_remap, var_remap, pointer_to_buffer, new_buffer_to_const
+            f.body,
+            buf_remap,
+            var_remap,
+            pointer_to_buffer,
+            new_buffer_var_to_const,
+            new_buffer_to_split_idx,
         )
 
         # Step 4: Rewrite the buffer map and const dict to instead use the encoded versions
@@ -527,10 +679,10 @@ def EncodeConstants(const_dict):
             if buffer in buf_remap:
                 buffer = buf_remap[buffer]
 
-            if buffer in new_buffer_to_const:
-                new_const_dict[i] = new_buffer_to_const[buffer]
-            elif buffer in old_buffer_to_const:
-                new_const_dict[i] = old_buffer_to_const[buffer]
+            if buffer.data in new_buffer_var_to_const:
+                new_const_dict[i] = new_buffer_var_to_const[buffer.data].flatten()
+            elif buffer.data in old_buffer_var_to_const:
+                new_const_dict[i] = old_buffer_var_to_const[buffer.data].flatten()
 
             new_buffer_map[param] = buffer
 
@@ -539,7 +691,6 @@ def EncodeConstants(const_dict):
             new_body,
             f.ret_type,
             new_buffer_map,
-            f.preflattened_buffer_map,
             f.attrs,
             f.span,
         )
@@ -774,7 +925,6 @@ def CreatePrimFuncWithoutConstants(const_dict):
     def _ftransform(f, mod, ctx):
         new_params = list()
         new_buffer_map = dict()
-        new_preflattened_buffer_map = dict()
         for param_idx in const_dict.keys():
             # We are using buffer_var to key the constants as
             # PrimFunc params of constants will be removed.
@@ -783,14 +933,11 @@ def CreatePrimFuncWithoutConstants(const_dict):
             if i not in const_dict.keys():
                 new_params.append(param)
                 new_buffer_map[param] = f.buffer_map[param]
-                if param in f.preflattened_buffer_map:
-                    new_preflattened_buffer_map[param] = f.preflattened_buffer_map[param]
         return tvm.tir.PrimFunc(
             new_params,
             f.body,
             f.ret_type,
             new_buffer_map,
-            new_preflattened_buffer_map,
             f.attrs,
             f.span,
         )
@@ -815,3 +962,87 @@ def HoistAllocates() -> tvm.IRModule:
         The new module with hoisted allocate nodes.
     """
     return _ffi_api.HoistAllocates()
+
+
+def CopyComputeReordering(
+    max_copy_movements: Optional[int] = None, reorder_by_cycles: Optional[bool] = None
+) -> tvm.IRModule:
+    """
+    Reorders copy and compute nodes in such a way that independent DMA copies
+    and computes happen in parallel.
+    Copies to buffers with local scope are not reordered since they copy LUT
+    into the SHRAM and that already happens in parallel with copying weights into
+    the weights encoder.
+
+    If reorder_by_cycles is set, we use the compute_cycles_hint to decide the reordering. If it is
+    not set, we move the copies up by a fixed number of movements, either by max_copy_movements if
+    it is specified, or by default value of 1.
+
+    If reordering based on the cycle count is enabled, we try to achieve further copy latency
+    hiding with a two step algorithm:
+    (1) Move all the global copies (i.e. copies that copy a constant into SRAM for conv2d or
+    depthwise_conv2d) above a preceding compute op. If in general the computes take longer than
+    copies, this should be enough to hide the copy latencies.
+    (2) If there are some global copies that take longer than the computes, we might be able to
+    hide them further by moving them further up in a graph since in general there are more compute
+    ops than copy ops in a graph (as only conv2d and depthwise_conv2d have constants associated
+    with them). The algortithm checks whether a copy is hidden and if it is not, it checks if a
+    preceding compute op has a preceding copy and if it doesn't it moves the copy that we try to
+    hide further up. It keeps moving the copy until it can't move it any further or until the
+    latency is hidden.
+
+    Parameters
+    ----------
+    max_copy_movements: Optional[int]
+        The maximum number of movements allowed for a copy.
+        If None, the pass context option
+        tir.contrib.ethos-u.copy_compute_reordering_max_copy_movements
+        is used if provided, otherwise the default value will be 1.
+
+    reorder_by_cycles: Optional[bool]
+        Whether to reorder the computes and copies based on the cycle hint.
+        If None, the pass context option
+        tir.contrib.ethos-u.copy_compute_reordering_reorder_by_cycles
+        is used if provided, otherwise the default value will be False.
+
+    Returns
+    -------
+    tvm.IRModule
+        The new module with copy and compute nodes reordered.
+    """
+    return _ffi_api.CopyComputeReordering(max_copy_movements, reorder_by_cycles)
+
+
+def MergeConstants(const_dict):
+    """
+    This pass looks for the constants used by each compute operator
+    and merges them into a single buffer.
+    Constants written to a buffer with local scope are not merged.
+    """
+
+    def _merge_constants(mod):
+        nonlocal const_dict
+        try:
+            mod["main"]
+        except:
+            raise tvm.TVMError(
+                "Expected a single primitive function called 'main'. "
+                "Please run the MergeConstants pass in conjunction with the LowerToTIR() pass."
+            )
+
+        new_const_dict = {}
+        for param in const_dict.keys():
+            new_const_dict[tvm.tir.IntImm("int64", param)] = tvm.nd.array(const_dict[param])
+        mod["main"] = mod["main"].with_attr("ethos-u.const_dict", new_const_dict)
+
+        mod = _ffi_api.MergeConstants()(mod)
+        const_dict = mod["main"].attrs["ethos-u.const_dict"]
+        mod = _ffi_api.RemoveConstDictAttribute()(mod)
+
+        new_const_dict = {}
+        for param in const_dict.keys():
+            new_const_dict[int(param)] = const_dict[param].numpy()
+
+        return mod, new_const_dict
+
+    return _merge_constants

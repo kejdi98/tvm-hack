@@ -15,25 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 """Local Runner"""
-from contextlib import contextmanager
 import logging
+from contextlib import contextmanager
 from typing import Callable, List, Optional, Union
+import subprocess
 
 import tvm
 
 from ...contrib.popen_pool import PopenPoolExecutor
 from ...runtime import Device, Module
+from ..logging import get_logger
+from ..profiler import Profiler
 from ..utils import derived_object, get_global_func_with_default_on_worker
 from .config import EvaluatorConfig
-from .runner import PyRunner, RunnerFuture, RunnerInput, RunnerResult, PyRunnerFuture
+from .runner import PyRunner, PyRunnerFuture, RunnerFuture, RunnerInput, RunnerResult
 from .utils import (
-    T_ARGUMENT_LIST,
     T_ARG_INFO_JSON_OBJ_LIST,
+    T_ARGUMENT_LIST,
     alloc_argument_common,
     run_evaluator_common,
 )
 
-logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 
 T_ALLOC_ARGUMENT = Callable[  # pylint: disable=invalid-name
@@ -136,26 +139,29 @@ def _worker_func(
             yield
         finally:
             # Final step. Always clean up
-            f_cleanup()
+            with Profiler.timeit("LocalRunner/cleanup"):
+                f_cleanup()
 
     with resource_handler():
         # Step 1: create the local runtime module
-        rt_mod = tvm.runtime.load_module(artifact_path)
-        # Step 2: create the local device
-        device = tvm.runtime.device(dev_type=device_type, dev_id=0)
-        # Step 3: Allocate input arguments
-        repeated_args: List[T_ARGUMENT_LIST] = f_alloc_argument(
-            device,
-            args_info,
-            alloc_repeat,
-        )
-        # Step 4: Run time_evaluator
-        costs: List[float] = f_run_evaluator(
-            rt_mod,
-            device,
-            evaluator_config,
-            repeated_args,
-        )
+        with Profiler.timeit("LocalRunner/load_module"):
+            rt_mod = tvm.runtime.load_module(artifact_path)
+        # Step 2: Allocate input arguments
+        with Profiler.timeit("LocalRunner/alloc_argument"):
+            device = tvm.runtime.device(dev_type=device_type, dev_id=0)
+            repeated_args: List[T_ARGUMENT_LIST] = f_alloc_argument(
+                device,
+                args_info,
+                alloc_repeat,
+            )
+        # Step 3: Run time_evaluator
+        with Profiler.timeit("LocalRunner/run_evaluator"):
+            costs: List[float] = f_run_evaluator(
+                rt_mod,
+                device,
+                evaluator_config,
+                repeated_args,
+            )
     return costs
 
 
@@ -268,11 +274,16 @@ class LocalRunner(PyRunner):
         self.f_run_evaluator = f_run_evaluator
         self.f_cleanup = f_cleanup
 
+        err_path = subprocess.DEVNULL
+        if logger.root.level <= logging.DEBUG:
+            err_path = subprocess.STDOUT
+
         logger.info("LocalRunner: max_workers = 1")
         self.pool = PopenPoolExecutor(
             max_workers=1,  # one local worker
             timeout=timeout_sec,
             initializer=initializer,
+            stderr=err_path,  # suppress the stderr output
         )
         self._sanity_check()
 
@@ -293,7 +304,7 @@ class LocalRunner(PyRunner):
             try:
                 result: List[float] = future.result()
                 error_message: str = None
-            except TimeoutError as exception:
+            except TimeoutError:
                 result = None
                 error_message = f"LocalRunner: Timeout, killed after {self.timeout_sec} seconds\n"
             except Exception as exception:  # pylint: disable=broad-except
@@ -312,9 +323,6 @@ class LocalRunner(PyRunner):
             get_global_func_with_default_on_worker(name=f_alloc_argument, default=None)
             get_global_func_with_default_on_worker(name=f_run_evaluator, default=None)
             get_global_func_with_default_on_worker(name=f_cleanup, default=None)
-            get_global_func_with_default_on_worker(
-                name="tvm.contrib.random.random_fill", default=None
-            )
 
         value = self.pool.submit(
             _check,
@@ -347,7 +355,7 @@ def default_alloc_argument(
         The allocation args
     """
     f_random_fill = get_global_func_with_default_on_worker(
-        name="tvm.contrib.random.random_fill", default=None
+        name="tvm.contrib.random.random_fill_for_measure", default=None
     )
     return alloc_argument_common(f_random_fill, device, args_info, alloc_repeat)
 
@@ -382,3 +390,15 @@ def default_run_evaluator(
 def default_cleanup() -> None:
     """Default function to clean up the session"""
     pass  # pylint: disable=unnecessary-pass
+
+
+@tvm.register_func("meta_schedule.runner.get_local_runner")
+def get_local_builder() -> LocalRunner:
+    """Get the local Runner.
+
+    Returns
+    -------
+    runner: LocalRunner
+        The local runner
+    """
+    return LocalRunner()

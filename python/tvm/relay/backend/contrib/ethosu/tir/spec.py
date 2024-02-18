@@ -184,6 +184,16 @@ class SerialBlockConfig(SerializableFormat):
         self.depth = depth
 
 
+class SerialRescaleConfig(SerializableFormat):
+    """Specialization class to retrieve arguments of a rescale parameters
+    (to fill in rescale field in Vela NpuElementWiseOperation) on a predefined ordering"""
+
+    def __init__(self, use_rescale: bool, scale: int, shift: int):
+        self.use_rescale = use_rescale
+        self.scale = scale
+        self.shift = shift
+
+
 class Serial2DConvolution(SerializableFormat):
     """Specialization class to retrieve arguments of
     a ethosu.conv2d tir extern call on a predefined ordering"""
@@ -194,8 +204,10 @@ class Serial2DConvolution(SerializableFormat):
         ofm: SerialFeatureMap,
         kernel: SerialKernel,
         weight: SerialAddressRange,
+        weight2: SerialAddressRange,
         weight_zero_point: int,
         scale_bias: SerialAddressRange,
+        scale_bias2: SerialAddressRange,
         padding: SerialPadding,
         activation: SerialActivation,
         rounding_mode: str,
@@ -206,8 +218,10 @@ class Serial2DConvolution(SerializableFormat):
         self.ofm = ofm
         self.kernel = kernel
         self.weight = weight
+        self.weight2 = weight2
         self.weight_zero_point = weight_zero_point
         self.scale_bias = scale_bias
+        self.scale_bias2 = scale_bias2
         self.padding = padding
         self.activation = activation
         self.rounding_mode = rounding_mode
@@ -302,6 +316,7 @@ class SerialBinaryElementwise(SerializableFormat):
         activation: SerialActivation,
         rounding_mode: str,
         block_config: SerialBlockConfig,
+        rescale_config: SerialRescaleConfig,
     ):
         self.ifm = ifm
         self.ifm2 = ifm2
@@ -311,6 +326,7 @@ class SerialBinaryElementwise(SerializableFormat):
         self.activation = activation
         self.rounding_mode = rounding_mode
         self.block_config = block_config
+        self.rescale_config = rescale_config
 
 
 class SerialUnaryElementwise(SerializableFormat):

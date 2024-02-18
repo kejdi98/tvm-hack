@@ -22,7 +22,7 @@ from tvm import te
 from tvm.contrib import cublas
 from tvm.autotvm.task.space import SplitEntity, OtherOptionEntity
 from .. import nn, generic
-from ..utils import traverse_inline, get_const_tuple, get_max_power2_factor, is_target
+from ..utils import traverse_inline, get_const_tuple, get_max_power2_factor
 from .tensor_intrin import dp4a
 
 
@@ -342,7 +342,7 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     _, N, _ = get_const_tuple(input_y.shape)
 
     k_factor = 4
-    assert K % k_factor == 0, "Input dimension must divide {}".format(k_factor)
+    assert K % k_factor == 0, f"Input dimension must divide {k_factor}"
     if K % 16 == 0:
         k_factor = 16
 
@@ -352,7 +352,7 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     cfg.define_split("tile_k", K // k_factor, num_outputs=2)
     cfg.define_knob("auto_unroll_max_step", [0, 256, 512, 1024])
 
-    batch_matmul_op = s.outputs[0]
+    batch_matmul_op = s[output].op
     s[input_x].compute_inline()
     s[input_y].compute_inline()
 
@@ -367,14 +367,15 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     # dp4a tensorize
 
     target = tvm.target.Target.current(allow_none=False)
-    do_tensorize = True
-
-    if is_target(["vulkan", "rocm"]):
-        do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
 
     if do_tensorize:
         dtypes = (input_x.dtype, input_y.dtype)
         s[batch_matmul_cache].tensorize(ki, dp4a("shared", "shared", "local", dtypes))
+
+    if batch_matmul_op not in s.outputs:
+        s[output].compute_inline()
+        batch_matmul_op = s.outputs[0]
 
     # tile axis
     f, m, n = batch_matmul_op.axis

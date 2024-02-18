@@ -64,7 +64,8 @@ Layout AdjustSubordinateFactors(const Layout& src_layout, const Layout& old_layo
 
         // 4) a) Check if this shape element is 1.
         if (auto* shape_int = shape_val.as<IntImmNode>()) {
-          if (shape_int->value == 1) {
+          // We can treat 1 as broadcast only if axis was not split before
+          if (shape_int->value == 1 && old_layout.IndexOf(LayoutAxis::Get(axis)) == -1) {
             new_layout += "1";
             is_shape_one = true;
           }
@@ -147,7 +148,6 @@ Layout TryTransformLike(const Layout& old, const Layout& ref_old, const Layout& 
     for (int i = 0; i < 26; ++i)
       if (!used[i]) return 'A' + i;
     LOG(FATAL) << "All letters are used";
-    return 0;
   };
 
   for (int j = old->axes.size() - 1, i = ref_old->axes.size() - 1; j >= 0; --i, --j) {

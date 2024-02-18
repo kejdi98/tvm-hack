@@ -15,13 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=invalid-name, import-self, len-as-condition, unused-argument, too-many-lines
-# pylint: disable=import-outside-toplevel
+# pylint: disable=import-outside-toplevel, used-before-assignment, use-implicit-booleaness-not-comparison
 """OneFlow: OneFlow is a performance-centered and open-source deep learning framework."""
 
 import os
 import re
 import copy
-import warnings
+from collections import OrderedDict
 
 import numpy as np
 import tvm
@@ -33,16 +33,7 @@ from .. import expr as _expr
 from .. import function as _function
 from .. import op as _op
 from .. import ty as _ty
-from .common import (
-    AttrCvt,
-    Renamer,
-    fold_constant,
-    get_relay_op,
-    infer_channels,
-    infer_shape,
-    infer_type,
-    new_var,
-)
+from .common import AttrCvt, Renamer, fold_constant, get_relay_op, infer_shape, infer_type, new_var
 
 __all__ = ["from_oneflow"]
 
@@ -85,10 +76,10 @@ def get_node_info(node):
     shape = tuple(node.input_conf.blob_conf.shape.dim)
     # get data type
     dtype = node.input_conf.blob_conf.data_type
-    if dtype in list(FLOW_2_NP_DTYPE.keys()):
-        data_type = FLOW_2_NP_DTYPE[dtype]
+    if dtype in list(FLOW_2_STR_DTYPE.keys()):
+        data_type = FLOW_2_STR_DTYPE[dtype]
     else:
-        raise IndexError("Please check the data type of your node: %s" % node.name)
+        raise IndexError(f"Please check the data type of your node: {node.name}")
 
     return shape, data_type
 
@@ -97,7 +88,6 @@ def _dtype_shape_promotion(inputs):
     """Promote data type and shape for list of tensors."""
 
     dtype_order = ["bool", "int8", "int16", "int32", "int64", "float32", "float64"]
-
     ranks = [len(infer_shape(x)) for x in inputs]
     if set(ranks) == set([1, 0]):
         for i, r in enumerate(ranks):
@@ -186,9 +176,9 @@ class OneFlowOpConverter(object):
         converter, which should be `_impl_vx`.
         """
         version = 1
-        if hasattr(cls, "_impl_v{}".format(version)):
-            return getattr(cls, "_impl_v{}".format(version))
-        raise NotImplementedError("version {} of {} not implemented".format(version, cls.__name__))
+        if hasattr(cls, f"_impl_v{version}"):
+            return getattr(cls, f"_impl_v{version}")
+        raise NotImplementedError(f"version {version} of {cls.__name__} not implemented")
 
 
 class Pool(OneFlowOpConverter):
@@ -244,7 +234,7 @@ class GlobalAveragePool(OneFlowOpConverter):
             return _op.nn.global_avg_pool3d(inputs[0])
         raise NotImplementedError(
             "Global average pooling is only implemented for 1D, 2D, and 3D kernels, got %dD."
-            % (rank - 2),
+            % (rank - 2)
         )
 
 
@@ -262,7 +252,7 @@ class GlobalMaxPool(OneFlowOpConverter):
             return _op.nn.global_max_pool3d(inputs[0])
         raise NotImplementedError(
             "Global max pooling is only implemented for 1D, 2D, and 3D kernels, got %dD."
-            % (rank - 2),
+            % (rank - 2)
         )
 
 
@@ -274,8 +264,8 @@ class Conv(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         # The kernel is imported from model_dir_path, without the ".weight" logo, etc.
-        # The data is obtained through the graph, its op contains "-input_"
-        in_names = ["-input_"]
+        # The data is obtained through the graph, its op contains "_input."
+        in_names = ["_input."]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -316,9 +306,7 @@ class Conv(OneFlowOpConverter):
 
         out = AttrCvt(
             op_name=cls.name,
-            transforms={
-                "group": ("groups", 1),
-            },
+            transforms={"group": ("groups", 1)},
             ignores=["data_format", "filters", "padding_after", "padding_before"],
             custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
@@ -335,7 +323,7 @@ class ConvTranspose(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        in_names = ["-input_"]
+        in_names = ["_input."]
         kernel_names = [".weight"]
         for i in inputs:
             IN_NAMES = any(x in str(i) for x in in_names)
@@ -366,9 +354,7 @@ class ConvTranspose(OneFlowOpConverter):
 
         out = AttrCvt(
             op_name=cls.name,
-            transforms={
-                "group": ("groups", 1),
-            },
+            transforms={"group": ("groups", 1)},
             disables=["filters", "data_format", "padding_before"],
             custom_check=dimension_constraint(),
         )([data, kernel], attrs, params)
@@ -470,7 +456,7 @@ class BatchNorm(OneFlowOpConverter):
         # sort the inputs
         sorted_inputs = copy.deepcopy(inputs)
         for i in inputs:
-            IN_NAMES = "-input_" in str(i)
+            IN_NAMES = "_input." in str(i)
             if IN_NAMES:
                 sorted_inputs[0] = i
             elif "weight" in str(i) and not IN_NAMES:
@@ -497,19 +483,26 @@ class Flatten(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        axis = attrs.get("axis", 1)
-        ishape = _op.shape_of(inputs[0])
-        ndim = infer_shape(ishape)[0]
-        if axis < 0:
-            axis = axis + ndim
+        x = inputs[0]
+        input_shape = list(infer_shape(x))
 
-        if axis == 1:
-            out = _op.nn.batch_flatten(inputs[0])
-        else:
-            pre_shape = _op.prod(_op.strided_slice(ishape, [0], [axis], [1]), keepdims=True)
-            post_shape = _op.prod(_op.strided_slice(ishape, [axis], [ndim], [1]), keepdims=True)
-            newshape = _op.concatenate([pre_shape, post_shape], axis=0)
-            out = _op.reshape(inputs[0], newshape)
+        start = attrs["start_dim"]
+        end = attrs["end_dim"]
+        ndim = len(input_shape)
+        if end < 0:
+            end += ndim
+        new_shape = [0] * start
+
+        new_shape.append(-1)
+        squeeze_axes = []
+        for i in range(start + 1, end + 1):
+            new_shape.append(1)
+            squeeze_axes.append(i)
+        for _ in range(end + 1, ndim):
+            new_shape.append(0)
+        out = _op.reshape(x, new_shape)
+        if squeeze_axes:
+            out = _op.squeeze(out, axis=squeeze_axes)
         return out
 
 
@@ -518,36 +511,119 @@ class MatMul(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Gemm op take 2 inputs, {} given".format(len(inputs))
-        # Similar to 'class Conv'
-        true_names = ["weight"]
-        false_names = ["-input_"]
-        for i in inputs:
-            T_NAMES = any(x in str(i) for x in true_names)
-            F_NAMES = any(x in str(i) for x in false_names)
-            if T_NAMES and not F_NAMES:
-                matmul_b = i
-            else:
-                matmul_a = i
+        assert len(inputs) == 2, f"MatMul op take 2 inputs, {len(inputs)} given"
 
-        dtype = infer_type(matmul_a).checked_type.dtype
-
+        dtype = infer_type(inputs[0]).checked_type.dtype
         # Y = alpha * A * B
         alpha = float(attrs.get("alpha", 1.0))
         transA = bool(attrs.get("transpose_a", False))
         transB = bool(attrs.get("transpose_b", False))
 
-        # get number of channels
-        channels = infer_channels(matmul_b, not transB)
-        if transA:
-            matmul_a = _op.transpose(matmul_a, axes=(1, 0))
-        if not transB:
-            matmul_b = _op.transpose(matmul_b, axes=(1, 0))
-        matmul_a = _op.nn.batch_flatten(matmul_a)
-        if alpha != 1.0:
-            matmul_a *= _expr.const(alpha, dtype=dtype)
+        a_shape = infer_shape(inputs[0])
+        b_shape = infer_shape(inputs[1])
+        if (
+            (transA and transB and a_shape[-2] != b_shape[-1])
+            or (transA and not transB and a_shape[-2] != b_shape[-2])
+            or (transB and not transA and a_shape[-1] != b_shape[-1])
+            or (not transB and not transA and a_shape[-1] != b_shape[-2])
+        ):
+            matmul_a = inputs[1]
+            matmul_b = inputs[0]
+        else:
+            matmul_a = inputs[0]
+            matmul_b = inputs[1]
 
-        return _op.nn.dense(matmul_a, matmul_b, units=channels)
+        if transA:
+            perm = list(range(len(a_shape)))
+            perm[-2] = len(a_shape) - 1
+            perm[-1] = len(a_shape) - 2
+            matmul_a = _op.transpose(matmul_a, axes=perm)
+        if transB:
+            perm = list(range(len(b_shape)))
+            perm[-2] = len(b_shape) - 1
+            perm[-1] = len(b_shape) - 2
+            matmul_b = _op.transpose(matmul_b, axes=perm)
+
+        # This implemention almost keeps same with ONNX
+        # Need to check input shape as batch matmul must be supported.
+        a_shape = shape_of(matmul_a, dtype="int32")
+        a_rank = infer_shape(a_shape)[0]
+        b_shape = shape_of(matmul_b, dtype="int32")
+        b_rank = infer_shape(b_shape)[0]
+        # When performing a batch matmul, we need to properly handle N-dim shapes.
+        if a_rank > 2 or b_rank > 2:
+
+            def flatten_to_nd(x, x_shape, nd=3):
+                ndims = infer_shape(x_shape)[0]
+                if ndims == nd:
+                    return x
+                newshape = _op.concatenate(
+                    [
+                        _expr.const([-1], dtype=infer_type(x_shape).checked_type.dtype),
+                        _op.strided_slice(x_shape, [ndims - nd + 1], [ndims]),
+                    ],
+                    0,
+                )
+                out = _op.reshape(x, fold_constant(newshape))
+                return out
+
+            b_type = infer_type(matmul_b)
+            # Convert to dense if the second matrix is 2d and non-dynamic
+            if b_rank == 2 and not _ty.is_dynamic(b_type.checked_type):
+                a = flatten_to_nd(matmul_a, a_shape, 2)
+                b = _op.transpose(matmul_b)
+                output = _op.nn.dense(a, b)
+            else:
+                # Convert a and b into 3 dimensional tensors.
+                a = flatten_to_nd(matmul_a, a_shape, 3)
+                b = flatten_to_nd(matmul_b, b_shape, 3)
+                # Transpose matrix dimensions of b.
+                b = _op.transpose(b, [0, 2, 1])
+                # Perform a batch matmul.
+                output = _op.nn.batch_matmul(a, b)
+            # Determine the output batch dimension.
+            if a_rank > b_rank:
+                out_batch = _op.strided_slice(a_shape, [0], [a_rank - 2])
+            elif a_rank < b_rank:
+                out_batch = _op.strided_slice(b_shape, [0], [b_rank - 2])
+            # If its unclear how broadcasting should be applied, the output
+            # shape is determined by choosing the maximum value from each input.
+            else:
+                out_batch = _op.concatenate(
+                    [
+                        _op.maximum(
+                            _op.strided_slice(a_shape, [i], [i + 1]),
+                            _op.strided_slice(b_shape, [i], [i + 1]),
+                        )
+                        for i in range(a_rank - 2)
+                    ],
+                    0,
+                )
+            # Reshape output to original dimensions.
+            final_shape = _op.concatenate(
+                [
+                    out_batch,
+                    _op.strided_slice(
+                        a_shape, [infer_shape(a_shape)[0] - 2], [infer_shape(a_shape)[0] - 1]
+                    ),
+                    _op.strided_slice(
+                        b_shape, [infer_shape(b_shape)[0] - 1], [infer_shape(b_shape)[0]]
+                    ),
+                ],
+                0,
+            )
+            out = _op.reshape(output, fold_constant(final_shape))
+        else:
+            if b_rank == 1:
+                matmul_b = _op.expand_dims(matmul_b, 1, 1)
+            # Otherwise a simple dense op will get the job done.
+            input_1_t = _op.transpose(matmul_b, axes=(1, 0))
+            out = _op.nn.dense(matmul_a, input_1_t)
+            if b_rank == 1:
+                out = _op.squeeze(out, axis=[-1])
+        if not np.isclose(alpha, 1.0):
+            out = out * _expr.const(alpha, dtype=dtype)
+        return out
 
 
 class Reduce(OneFlowOpConverter):
@@ -590,9 +666,7 @@ class Square(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 1, "Square op {} take 1 inputs, {} given".format(
-            cls.name, len(inputs)
-        )
+        assert len(inputs) == 1, f"Square op {cls.name} take 1 inputs, {len(inputs)} given"
         return _op.multiply(inputs[0], inputs[0])
 
 
@@ -603,11 +677,11 @@ class Add(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+        assert len(inputs) == 2, f"Math op {cls.name} take 2 inputs, {len(inputs)} given"
         axis = int(attrs.get("axis", 0))
 
         true_names = ["weight", "bias"]
-        false_names = ["-input_"]
+        false_names = ["_input."]
 
         for i in inputs:
             T_NAMES = any(x in str(i) for x in true_names)
@@ -635,13 +709,32 @@ class Expand(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        input_shape = infer_shape(inputs[0])
-        assert input_shape == attrs["in_shape"], "shape wrong"
+        data_in = inputs[0]
+        shape = list(infer_shape(data_in))
 
-        new_shape = attrs["out_shape"]
-        out = _op.broadcast_to(inputs[0], shape=new_shape)
+        ndims = len(shape)
+        sizes = attrs["logical_expand_shape"]
+        out = data_in
+        out_dims = len(sizes)
+        if ndims < out_dims:
+            num_newaxis = out_dims - ndims
+            out = _op.expand_dims(out, axis=0, num_newaxis=num_newaxis)
+            shape = [1] * num_newaxis + shape
+
+        for i in range(out_dims):
+            if sizes[i] != -1 and shape[i] == 1:
+                out = _op.repeat(out, sizes[i], axis=i)
 
         return out
+
+
+class Transpose(OneFlowOpConverter):
+    """Operator converter for transpose."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        perm = attrs["perm"]
+        return _op.transpose(inputs[0], axes=perm)
 
 
 class ExpandDim(OneFlowOpConverter):
@@ -649,7 +742,6 @@ class ExpandDim(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-
         return _op.expand_dims(inputs[0], axis=attrs.get("axis", 0))
 
 
@@ -660,12 +752,12 @@ class BroadcastMath(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "Math op {} take 2 inputs, {} given".format(cls.name, len(inputs))
+        assert len(inputs) == 2, f"Math op {cls.name} take 2 inputs, {len(inputs)} given"
         beta_names = ["weight", "bias", "mean", "var", "Constant"]
 
         for i in inputs:
             T_NAMES = any([x in str(i) for x in beta_names])
-            if T_NAMES and "-input_" not in str(i):
+            if T_NAMES and "_input." not in str(i):
                 input_b = i
             else:
                 input_a = i
@@ -718,12 +810,25 @@ class BroadcastDiv(BroadcastMath):
     name = "divide"
 
 
-class Greater(OneFlowOpConverter):
+class LogicalGreater(OneFlowOpConverter):
     """Operator converter for greater"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        return _op.greater(inputs[0], inputs[1])
+        res = None
+        if attrs.get("has_int_operand", True):
+            value = attrs.get("int_operand", 0.0)
+            res = _op.greater(inputs[0], _op.full_like(inputs[0], fill_value=_expr.const(value)))
+        elif attrs.get("has_float_operand", True):
+            value = float(attrs.get("float_operand", 0.0))
+            res = _op.greater(
+                inputs[0], _op.full_like(inputs[0], fill_value=_expr.const(value)).astype("float32")
+            )
+        else:
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
+        return res
 
 
 class Log1p(OneFlowOpConverter):
@@ -732,6 +837,15 @@ class Log1p(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         return _op.log(inputs[0] + _expr.const(1.0))
+
+
+class Pow(OneFlowOpConverter):
+    """Operator converter for Power"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        inputs = _dtype_shape_promotion(inputs)
+        return get_relay_op(cls.name)(inputs[0], inputs[1])
 
 
 class Expm1(OneFlowOpConverter):
@@ -749,9 +863,7 @@ class Unary(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 1, "Unary math op {} takes 1 input, {} given".format(
-            cls.name, len(inputs)
-        )
+        assert len(inputs) == 1, f"Unary math op {cls.name} takes 1 input, {len(inputs)} given"
         return get_relay_op(cls.name)(*inputs)
 
 
@@ -779,7 +891,7 @@ class ScalarAdd(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
+        assert len(inputs) == 1, f"add_scalar take == 1 inputs, but {len(inputs)} given."
 
         if attrs.get("has_int_operand", True):
             res = inputs[0] + _expr.const(attrs["int_operand"])
@@ -798,7 +910,7 @@ class ScalarMul(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 1, "add_scalar take == 1 inputs, but {} given.".format(len(inputs))
+        assert len(inputs) == 1, f"mul_scalar take == 1 inputs, but {len(inputs)} given."
 
         if attrs.get("has_int_operand", True):
             res = inputs[0] * _expr.const(attrs["int_operand"], dtype="float32")
@@ -812,14 +924,35 @@ class ScalarMul(OneFlowOpConverter):
         return res
 
 
+class ScalarDiv(OneFlowOpConverter):
+    """Operator convert for Div_scalar"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        assert len(inputs) == 1, f"div_scalar take == 1 inputs, but {len(inputs)} given."
+
+        if attrs.get("has_int_operand", True):
+            res = inputs[0] / _expr.const(attrs["int_operand"], dtype="float32")
+        elif attrs.get("has_float_operand", True):
+            res = inputs[0] / _expr.const(attrs["float_operand"])
+        else:
+            raise AttributeError(
+                "please check if has_int_operand or has_float_operand in your attrs"
+            )
+
+        return res
+
+
 class ScalarPow(OneFlowOpConverter):
     """Operator convert for Pow_scalar"""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        exponent = attrs.get("exponent", 1.0)
-        exponent = _expr.const(exponent, dtype="float32")
-        return _op.power(inputs[0], exponent)
+        if attrs.get("has_int_operand", True):
+            coeff = _expr.const(attrs["int_operand"])
+        elif attrs.get("has_float_operand", True):
+            coeff = _expr.const(attrs["float_operand"])
+        return _op.power(inputs[0], coeff)
 
 
 class MaxPool2d(Pool):
@@ -857,15 +990,12 @@ class Softmax(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        axis = attrs.get("axis", 1)
-        ndim = len(infer_shape(inputs[0]))
-        if axis < 0:
-            axis += ndim
-        axes = list(range(axis, ndim))
-        x = inputs[0]
-        m = _op.max(x, axes, keepdims=True)
-        e = _op.exp(x - m)
-        return e / _op.sum(e, axes, keepdims=True)
+        axis = attrs.get("axis", -1)
+        data = inputs[0]
+        if isinstance(axis, str):
+            axis = int(axis)
+
+        return _op.nn.softmax(data, axis=axis)
 
 
 class LogSoftmax(OneFlowOpConverter):
@@ -894,15 +1024,17 @@ class Dropout(OneFlowOpConverter):
         return out
 
 
-class ThresholdedRelu(OneFlowOpConverter):
-    """Operator converter for ThresholdedRelu."""
+class Threshold(OneFlowOpConverter):
+    """Operator converter for Threshold."""
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        alpha = float(attrs.get("alpha", 1.0))
-        alpha_tensor = _op.full_like(inputs[0], fill_value=_expr.const(alpha))
-        mask = _op.greater(inputs[0], alpha_tensor).astype("float32")
-        return inputs[0] * mask
+        threshold = float(attrs.get("threshold_val", 1.0))
+        threshold_tensor = _op.full_like(inputs[0], fill_value=_expr.const(threshold))
+        value = float(attrs.get("value"))
+        value_tensor = _op.full_like(inputs[0], fill_value=_expr.const(value))
+        mask = _op.greater(inputs[0], threshold_tensor)
+        return _op.where(mask, inputs[0], value_tensor)
 
 
 class Elu(OneFlowOpConverter):
@@ -921,9 +1053,9 @@ class PReLU(OneFlowOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
-        assert len(inputs) == 2, "PReLU need 2 inputs, but {} given".format(len(inputs))
+        assert len(inputs) == 2, f"PReLU need 2 inputs, but {len(inputs)} given"
         for i in inputs:
-            if "-input_" in str(i):
+            if "_input." in str(i):
                 prelu_a = i
             else:
                 prelu_b = i
@@ -988,8 +1120,11 @@ class Softplus(OneFlowOpConverter):
     def _impl_v1(cls, inputs, attrs, params):
         data = inputs[0]
         data_dtype = infer_type(data).checked_type.dtype
-        data = _op.exp(data) + _expr.const(1, dtype=data_dtype)
-        return _op.log(data)
+        beta = _expr.const(float(attrs.get("beta", 1.0)))
+        threshold = float(attrs.get("threshold", 20.0))
+        threshold_ = _op.full_like(data, fill_value=_expr.const(threshold))
+        softplus_value = _op.log(_op.exp(data * beta) + _expr.const(1.0, dtype=data_dtype)) / beta
+        return _op.where(_op.greater(data * beta, threshold_), data, softplus_value)
 
 
 class Softsign(OneFlowOpConverter):
@@ -998,6 +1133,17 @@ class Softsign(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         return inputs[0] / (_expr.const(1.0) + Absolute.get_converter()(inputs, attrs, params))
+
+
+class Variance(OneFlowOpConverter):
+    """Operator converter for Variance"""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attrs, params):
+        axis = attrs["dim"]
+        keepdims = attrs["keepdim"]
+        unbiased = bool(attrs["unbiased"])
+        return _op.reduce.variance(inputs[0], axis=axis, keepdims=keepdims, unbiased=unbiased)
 
 
 class Concat(OneFlowOpConverter):
@@ -1069,7 +1215,7 @@ class Scatter(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         axis = attrs.get("axis", 0)
-        return _op.scatter(inputs[0], inputs[1], inputs[2], axis)
+        return _op.scatter_elements(inputs[0], inputs[1], inputs[2], axis)
 
 
 class Unsqueeze(OneFlowOpConverter):
@@ -1207,7 +1353,7 @@ class Range(OneFlowOpConverter):
     @classmethod
     def _impl_v1(cls, inputs, attrs, params):
         if len(inputs) != 0:
-            raise ValueError("Expect no inputs but get {}".format(len(inputs)))
+            raise ValueError(f"Expect no inputs but get {len(inputs)}")
         start = attrs.get("start", 0.0)
         limit = attrs.get("limit", 1.0)
         delta = attrs.get("delta", 1.0)
@@ -1234,6 +1380,7 @@ def get_convert_map():
         "bias_add": Add.get_converter(),
         "scalar_add": ScalarAdd.get_converter(),
         "scalar_mul": ScalarMul.get_converter(),
+        "scalar_div": ScalarDiv.get_converter(),
         "scalar_pow": ScalarPow.get_converter(),
         "reduce_sum": ReduceSum.get_converter(),
         "reduce_max": ReduceMax.get_converter(),
@@ -1243,7 +1390,7 @@ def get_convert_map():
         "broadcast_mul": BroadcastMul.get_converter(),
         "broadcast_sub": BroadcastSub.get_converter(),
         "broadcast_div": BroadcastDiv.get_converter(),
-        "broadcast_greater": Greater.get_converter(),
+        "scalar_logical_greater": LogicalGreater.get_converter(),
         "log": Renamer("log"),
         "log1p": Log1p.get_converter(),
         "acos": Renamer("acos"),
@@ -1258,7 +1405,7 @@ def get_convert_map():
         "sinh": Renamer("sinh"),
         "tan": Renamer("tan"),
         "tanh": Renamer("tanh"),
-        "pow": Renamer("power"),
+        "pow": Pow.get_converter(),
         "exp": Renamer("exp"),
         "expm1": Expm1.get_converter(),
         "floor": Renamer("floor"),
@@ -1271,7 +1418,7 @@ def get_convert_map():
         "sign": Sign.get_converter(),
         "erf": Erf.get_converter(),
         "erfc": Erfc.get_converter(),
-        "reciprocal_no_nan": Reciprocal.get_converter(),
+        "reciprocal": Reciprocal.get_converter(),
         # defs/activation
         "softmax": Softmax.get_converter(),
         "softsign": Softsign.get_converter(),
@@ -1279,14 +1426,17 @@ def get_convert_map():
         "relu": Renamer("relu"),
         "leaky_relu": Renamer("leaky_relu"),
         "prelu": PReLU.get_converter(),
+        "threshold": Threshold.get_converter(),
         "selu": Selu.get_converter(),
         "silu": Silu.get_converter(),
         "gelu": Gelu.get_converter(),
         # defs/nn
         "conv2d": Conv2d.get_converter(),
         "deconv2d": ConvTranspose2d.get_converter(),
-        "maxpool_2d": MaxPool2d.get_converter(),
-        "avgpool_2d": AveragePool2d.get_converter(),
+        "max_pool_2d": MaxPool2d.get_converter(),
+        "avg_pool_2d": AveragePool2d.get_converter(),
+        "maxpool_2d": MaxPool2d.get_converter(),  # Maintained for oneflow versions <= "0.7.0"
+        "avgpool_2d": AveragePool2d.get_converter(),  # Maintained for oneflow versions <= "0.7.0"
         "adaptive_avg_pool2d": AdaptiveAvgPool2d.get_converter(),
         "adaptive_max_pool2d": AdaptiveMaxPool2d.get_converter(),
         "dropout": Dropout.get_converter(),
@@ -1295,24 +1445,29 @@ def get_convert_map():
         "upsample_bilinear_2d": UpsampleBiLinear.get_converter(),
         # defs/tensor
         "matmul": MatMul.get_converter(),
+        "batch_matmul": MatMul.get_converter(),
+        "broadcast_matmul": MatMul.get_converter(),
         "concat": Concat.get_converter(),
         "clip_by_scalar": Clip.get_converter(),
         "slice": Slice.get_converter(),
         "expand": Expand.get_converter(),
-        "transpose": AttrCvt("transpose", {"perm": "axes"}),
+        "transpose": Transpose.get_converter(),
         "expand_dims": ExpandDim.get_converter(),
         "range": Range.get_converter(),
         "cast": Cast.get_converter(),
         # defs/others
         "reshape": Reshape.get_converter(),
         "constant": Constant.get_converter(),
-        # "where": Where.get_converter(),
+        "where": Where.get_converter(),
         "flatten": Flatten.get_converter(),
         "sigmoid": Renamer("sigmoid"),
         "sigmoid_v2": Renamer("sigmoid"),
         "hardsigmoid": HardSigmoid.get_converter(),
+        "softplus": Softplus.get_converter(),
         "squeeze": AttrCvt("squeeze", {"axes": "axis"}),
         "unsqueeze": Unsqueeze.get_converter(),
+        "identity": Renamer("copy"),
+        "var": Variance.get_converter(),
     }
 
 
@@ -1376,14 +1531,10 @@ def deal_with_input_convert(
     if node_input not in _nodes:
         if (
             node_path not in _input_path_2_name
-            or "-input_" in node_input
+            or "_input." in node_input
             or "FreeEagerTensor" in node_input
         ):
-            _nodes[node_input] = new_var(
-                node_input,
-                shape=node_input_shape,
-                dtype=node_input_dtype,
-            )
+            _nodes[node_input] = new_var(node_input, shape=node_input_shape, dtype=node_input_dtype)
         else:
             names = _input_path_2_name[node_path]
             node_replace = None
@@ -1394,7 +1545,7 @@ def deal_with_input_convert(
                 op_replace = copy.deepcopy(_nodes[node_replace])
                 _nodes[node_input] = op_replace
             else:
-                print("{} will not be in _nodes".format(node_input))
+                print(f"{node_input} will not be in _nodes")
 
 
 def deal_parameter_convert(
@@ -1402,7 +1553,7 @@ def deal_parameter_convert(
 ):
     """deal with parameter(weight) convert in oneflow."""
     for node_input_path in node_input_paths:
-        node_path = os.path.join(model_dir_path, node_input_path.replace("m.", ""))
+        node_path = os.path.join(model_dir_path, node_input_path.replace("m.", "", 1))
         node_input_name = node_input_path.split("/")[0]
         _input_path_2_name[node_path] = node_input_name
         for param_name in _model_array:
@@ -1430,8 +1581,8 @@ class OneflowGraph(object):
     node name:
     1. param: m.layer4.1.bn1.weight / ...
     2. buffer: m.layer4.1.bn1.running_mean / ...
-    3. node inputs: m.layer4.1.bn1-input_0
-    4. node outputs: m.layer4.1.bn1-output_0
+    3. node inputs: m.layer4.1.bn1_input.0
+    4. node outputs: m.layer4.1.bn1_output.0
     """
 
     def __init__(self, shape, dtype, nodes, model_dir_path):
@@ -1453,7 +1604,7 @@ class OneflowGraph(object):
         import oneflow
 
         model = oneflow.load(model_dir_path)
-        # model_array: keys: layer_name，values: dict('path', 'params')
+        # model_array: keys: layer_name, values: dict('path', 'params')
         for layer_name in model:
             layer = model[layer_name]
             layer_node = {}
@@ -1500,10 +1651,14 @@ class OneflowGraph(object):
                     self._dtype[node.name] = dtype
                     self._init_variable_node.append(node.name)
         if self._init_variable_node != []:
-            print("{} should be defined by user".format(self._init_variable_node))
+            print(f"{self._init_variable_node} should be defined by user")
 
     def _parse_input(self, node, model_dir_path):
+        input_user_conf_list = []
         for input_name in node.user_conf.input:
+            input_user_conf_list.append(input_name)
+        input_user_conf_list.sort()
+        for input_name in input_user_conf_list:
             node_input_paths = getattr(node.user_conf.input[input_name], "s")
             for i in node_input_paths:
                 node_input = i.split("/")[0]
@@ -1521,16 +1676,19 @@ class OneflowGraph(object):
 
     def _parse_output(self, op_name, outputs, cnt_init=0):
         """
-        o: m.classifier.1-output_xxx
+        o: m.classifier.1_output.xxx
         new_o: m.classifier.1-conv2d_0
-        "_"+new_o is in self._shape
+        "_"+new_o_xxx is in self._shape
         """
         for o in outputs:
-            if "-output_" not in o:
-                new_o = o.replace("-" + op_name, "-output")
-                new_o = new_o.replace("_" + new_o.split("_")[-1], "_0")
-                self._shape[o] = self._shape["_" + new_o]
-                self._dtype[o] = self._dtype["_" + new_o]
+            if "_output." not in o:
+                new_o = o.replace("-" + op_name, "_output")
+                new_o = new_o.replace("-" + new_o.split("-")[-1], ".0")
+                for k in self._shape.keys():
+                    if new_o in k:
+                        self._shape[o] = self._shape[k]
+                        self._dtype[o] = self._dtype[k]
+                        break
             elif len(outputs) > 1:
                 outputs.remove(o)
         if op_name.lower() == "dropout":
@@ -1545,58 +1703,11 @@ class OneflowGraph(object):
 
         return outputs
 
-    def from_oneflow(self, nodes, model_dir_path, freeze_params=True, user_input=None):
+    def from_oneflow(self, nodes, model_dir_path):
         """
-        Parameters
-        ----------
-        nodes : dict, keys: node.name, value: node
-            contain the graph
-        model_dir_path: str
-            The path of parameter
-        freeze_params: bool
-            If freeze_params is True,
-            the computational graph input is the input of the first layer of the network,
-            which cannot be specified by the user, e.g.
-            Default input is: %v_ResNetGraph_0-input_0: Tensor[(1, 3, 224, 224), float32]
-            User-defined input is: %_0-input_0: Tensor[(1, 3, 640, 480), float32]
-            If freeze_params is on, then conv1-in will be the graph input, not Input_0
-        user_input: dict
-            User-defined input information for the graph
-            {
-                node1_name:
-                {
-                    'name':  node1_name,   # str, like "%v_ResNetGraph_0-input_0"
-                    'shape': node1_shape,  # tuple
-                    'dtype': node1_dtype   # str, like "float32"
-                }
-                ...
-            }
-        We recommend that users specify the input by specifying the job function,
-        rather than by this function
-
-        Returns
-        -------
-        mod : tvm.IRModule
-            The returned relay module
-        params : dict
-            A dict of name: tvm.nd.array pairs, used as pretrained weights
+        Implementation of convert the OneFlow model into an equivalent Relay Function.
         """
-        # step 1: get the graph input
-        if not freeze_params:
-            for node_init_name in user_input:
-                if "-input_" not in node_init_name:
-                    raise KeyError(
-                        "user_input['name'] should contain '-input_' "
-                        + "to let program know that this is input node"
-                    )
-                self._nodes[node_init_name] = new_var(
-                    node_init_name,
-                    shape=user_input[node_init_name]["shape"],
-                    dtype=user_input[node_init_name]["dtype"],
-                )
-                self._inputs[node_init_name] = self._nodes[node_init_name]
-
-        # step 2: find out if unsupported ops are used
+        # step 1: find out if unsupported ops are used
         convert_map = get_convert_map()
         unsupported_ops = set()
         for node_name in nodes:
@@ -1616,7 +1727,7 @@ class OneflowGraph(object):
             msg += ", ".join(unsupported_ops)
             raise tvm.error.OpNotImplemented(msg)
 
-        # step 3: convert op
+        # step 2: convert op
         for node_name in nodes:
             node = nodes[node_name]
             if is_user_op(node):
@@ -1630,7 +1741,11 @@ class OneflowGraph(object):
                 self._parse_input(node, model_dir_path=model_dir_path)
 
                 node_inputs = oneflow_input()
+                input_user_conf_list = []
                 for input_name in node.user_conf.input:
+                    input_user_conf_list.append(input_name)
+                input_user_conf_list.sort()
+                for input_name in input_user_conf_list:
                     node_input_paths = getattr(node.user_conf.input[input_name], "s")
                     for i in node_input_paths:
                         node_input = i.split("/")[0]
@@ -1657,10 +1772,7 @@ class OneflowGraph(object):
 
                 assert (
                     len(node_outputs) == outputs_num
-                ), "Number of output mismatch {} vs {} in {}.".format(
-                    len(node_outputs), outputs_num, op_name
-                )
-
+                ), f"Number of output mismatch {len(node_outputs)} vs {outputs_num} in {op_name}."
                 if outputs_num == 1:
                     op = fold_constant(op)
                 else:
@@ -1675,10 +1787,9 @@ class OneflowGraph(object):
                     else:
                         self._nodes[node_outputs[i]] = op_temp[i]
 
-        # step 4: get the outputs
+        # step 3: get the outputs
         outputs = []
-        for node_name in nodes:
-            node = nodes[node_name]
+        for node_name, node in nodes.items():
             if is_output_op(node):
                 node_name_v2 = getattr(node.output_conf, "in").split("/")[0]
                 if node_name in self._nodes:
@@ -1687,32 +1798,33 @@ class OneflowGraph(object):
                     outputs.append(self._nodes[node_name_v2])
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
 
-        # step 5: get the relay IR
+        # step 4: get the relay IR
         free_vars = analysis.free_vars(outputs)
 
         nodes = {v: k for k, v in self._nodes.items()}
         free_vars = [nodes[var] for var in free_vars]
+        free_vars_inputs = []
+        free_vars_parameters = []
+        for x in free_vars:
+            if "_input.0" in x:
+                free_vars_inputs.append(x)
+            else:
+                free_vars_parameters.append(x)
+        free_vars = free_vars_inputs + free_vars_parameters
 
-        # step 6: make sure the '-input_0' is the first in self._inputs
+        # step 5: make sure the '_input.0' is the first in self._inputs
         for free_var in free_vars:
             if free_var not in self._inputs:
                 self._inputs[free_var] = self._nodes[free_var]
 
         input_names = list(self._inputs.keys())
-        for i, _ in enumerate(input_names):
-            if i != 0 and "-input_0" in input_names[i]:
-                str_buffer = copy.deepcopy(input_names[i])
-                del input_names[i]
-                input_names.insert(0, str_buffer)
-                break
-
         for input_name in input_names:
             if input_name in self._inputs:
                 self._sort_inputs[input_name] = self._inputs[input_name]
             else:
-                raise IndexError("{} is not in self._inputs".format(input_name))
+                raise IndexError(f"{input_name} is not in self._inputs")
 
-        # step 7: create a function from our output expression and all input variables.
+        # step 6: create a function from our output expression and all input variables.
         func = _function.Function([v for _, v in self._sort_inputs.items()], outputs)
 
         return IRModule.from_expr(func), self._params
@@ -1722,7 +1834,7 @@ class OneflowGraph(object):
         Parameters
         ----------
         op_name : str
-            Operator name, such as conv2d、relu
+            Operator name, such as conv2d and relu
         node_inputs : list of tvm.relay.function.Function
             List of inputs.
         op_attr : dict
@@ -1739,24 +1851,42 @@ class OneflowGraph(object):
         elif op_name in convert_map:
             sym = convert_map[op_name](node_inputs, op_attr, self._params)
         else:
-            raise NotImplementedError("Operator {} not implemented.".format(op_name))
+            raise NotImplementedError(f"Operator {op_name} not implemented.")
 
         return sym
 
 
-def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
-    """
-    see OneflowGraph.from_oneflow
+def from_oneflow(graph, model_dir_path):
+    """Convert a OneFlow model into an equivalent Relay Function.
+
+    At present, there are two ways to run models in deep learning framework
+    Dynamic Graph and Static Graph, which are also called Eager Mode and Graph
+    Mode in OneFlow.
+
+    In general, dynamic graphs are easier to use and static graphs have better performance.
+    OneFlow offers nn.Graph, so that users can use the eager-like programming style to build
+    static graphs and train the models.
+
+    We utilize the intermediate representation of nn.Graph to convert the OneFlow model to Reley.
+
+    Parameters
+    ----------
+    nodes : dict, keys: node.name, value: node
+        contain the graph
+    model_dir_path: str
+        The path of weight
+
+    Returns
+    -------
+    mod : tvm.IRModule
+        The returned relay module
+    params : dict
+        A dict of name: tvm.nd.array pairs, used as pretrained weights
     """
     try:
         import oneflow as flow
     except ImportError:
         raise ImportError("please check that OneFlow is installed")
-
-    if not freeze_params and user_input is None:
-        raise ValueError("if you want to specify graph input, please give the 'user_input'")
-    if freeze_params and user_input is not None:
-        warnings.warn("'user_input' will not work, please check the 'freeze_params'")
 
     # get info of nodes
     shape = {}
@@ -1780,7 +1910,10 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
             size_attr = size_str[0].replace("size=", "")
             if size_attr[-2] == ",":
                 size_attr = size_attr.replace(",", "")
-            data_size = tuple(map(int, size_attr[1:-1].split(", ")))
+            if size_attr == "()":
+                data_size = ()
+            else:
+                data_size = tuple(map(int, size_attr[1:-1].split(", ")))
             node_name = attrs[1]
             shape[node_name] = data_size
             dtype[node_name] = "float32"
@@ -1804,18 +1937,13 @@ def from_oneflow(graph, model_dir_path, freeze_params=True, user_input=None):
     graph_proto = graph._graph_proto
 
     # get all nodes
-    nodes = {}
+    nodes = OrderedDict()
     for op in graph_proto.net.op:
         nodes[op.name] = op
 
     g = OneflowGraph(shape, dtype, nodes, model_dir_path)
 
     # Use the graph proto as a scope so that ops can access other nodes if needed.
-    mod, params = g.from_oneflow(
-        nodes=nodes,
-        model_dir_path=model_dir_path,
-        freeze_params=freeze_params,
-        user_input=user_input,
-    )
+    mod, params = g.from_oneflow(nodes=nodes, model_dir_path=model_dir_path)
 
     return mod, params

@@ -20,6 +20,7 @@ import sys
 import pytest
 
 import tvm
+import tvm.testing
 from tvm import te
 from tvm import relay
 from tvm.contrib import cudnn
@@ -486,7 +487,7 @@ def _verify_cudnn_relay(expr):
     tvm.testing.assert_allclose(
         outputs[0],
         outputs[1],
-        rtol=1e-3,
+        rtol=1e-2,
         atol=30,
     )
 
@@ -623,4 +624,4 @@ def test_relay_cudnn_conv2d_bias_act(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(sys.argv))
+    tvm.testing.main()

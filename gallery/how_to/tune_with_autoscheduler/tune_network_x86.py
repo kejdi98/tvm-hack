@@ -24,7 +24,7 @@ Auto-tuning for specific devices and workloads is critical for getting the
 best performance. This is a tutorial on how to tune a whole neural
 network for x86 CPU with the auto-scheduler.
 
-To auto-tune a neural network, we partition the network into small subgraphs and 
+To auto-tune a neural network, we partition the network into small subgraphs and
 tune them independently. Each subgraph is treated as one search task.
 A task scheduler slices the time and dynamically allocates time resources to
 these tasks. The task scheduler predicts the impact of each task on the end-to-end
@@ -44,6 +44,8 @@ Note that this tutorial will not run on Windows or recent versions of macOS. To
 get it to run, you will need to wrap the body of this tutorial in a :code:`if
 __name__ == "__main__":` block.
 """
+
+import sys
 
 import numpy as np
 
@@ -115,19 +117,6 @@ def get_network(name, batch_size, layout="NHWC", dtype="float32", use_sparse=Fal
     elif name == "inception_v3":
         input_shape = (batch_size, 3, 299, 299) if layout == "NCHW" else (batch_size, 299, 299, 3)
         mod, params = relay.testing.inception_v3.get_workload(batch_size=batch_size, dtype=dtype)
-    elif name == "mxnet":
-        # an example for mxnet model
-        from mxnet.gluon.model_zoo.vision import get_model
-
-        assert layout == "NCHW"
-
-        block = get_model("resnet50_v1", pretrained=True)
-        mod, params = relay.frontend.from_mxnet(block, shape={"data": input_shape}, dtype=dtype)
-        net = mod["main"]
-        net = relay.Function(
-            net.params, relay.nn.softmax(net.body), None, net.type_params, net.attrs
-        )
-        mod = tvm.IRModule.from_expr(net)
     elif name == "mlp":
         mod, params = relay.testing.mlp.get_workload(
             batch_size=batch_size, dtype=dtype, image_shape=image_shape, num_classes=1000
@@ -174,6 +163,7 @@ mod, params, input_shape, output_shape = get_network(
     dtype=dtype,
     use_sparse=use_sparse,
 )
+
 print("Extract tasks...")
 tasks, task_weights = auto_scheduler.extract_tasks(mod["main"], params, target)
 

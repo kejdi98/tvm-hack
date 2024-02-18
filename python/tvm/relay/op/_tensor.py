@@ -21,7 +21,7 @@ from tvm.te.hybrid import script
 from tvm import topi
 from tvm.runtime import convert
 
-from .op import register_compute, register_shape_func
+from .op import register_compute, register_shape_func, register_legalize
 from .op import register_broadcast_schedule, register_injective_schedule
 from .op import register_pattern, OpPattern
 
@@ -93,6 +93,27 @@ register_broadcast_schedule("fast_tanh")
 register_broadcast_schedule("fast_erf")
 
 
+@register_legalize("erf")
+def legalize_erf(attrs, inputs, types):
+    """Legalize ERF op.
+
+    Parameters
+    ----------
+    attrs : tvm.ir.Attrs
+        Attributes of current convolution
+    inputs : list of tvm.relay.Expr
+        The args of the Relay expr to be legalized
+    types : list of types
+        List of input and output types
+
+    Returns
+    -------
+    result : tvm.relay.Expr
+        The legalized expr
+    """
+    return topi.math.erf_legalize(attrs, inputs, types)
+
+
 # zeros
 @register_compute("zeros")
 def zeros_compute(attrs, inputs, output_type):
@@ -148,6 +169,19 @@ def fixed_point_multiply_compute(attrs, inputs, output_type):
 
 
 register_injective_schedule("fixed_point_multiply")
+
+# per-channel/per-axis fixed point multiply
+@register_compute("fixed_point_multiply_per_axis")
+def fixed_point_multiply_per_axis_compute(attrs, inputs, output_type):
+    assert len(inputs) == 4
+    return [
+        topi.fixed_point_multiply_per_axis(
+            *inputs, attrs.is_lshift_required, attrs.is_rshift_required, attrs.axes
+        )
+    ]
+
+
+register_broadcast_schedule("fixed_point_multiply_per_axis")
 
 # full
 @script
@@ -271,6 +305,7 @@ register_shape_func("left_shift", False, broadcast_shape_func)
 register_shape_func("right_shift", False, broadcast_shape_func)
 
 register_shape_func("sqrt", False, elemwise_shape_func)
+register_shape_func("rsqrt", False, elemwise_shape_func)
 register_shape_func("negative", False, elemwise_shape_func)
 register_shape_func("exp", False, elemwise_shape_func)
 register_shape_func("tan", False, elemwise_shape_func)
@@ -285,3 +320,4 @@ register_shape_func("log2", False, elemwise_shape_func)
 register_shape_func("sigmoid", False, elemwise_shape_func)
 register_shape_func("tanh", False, elemwise_shape_func)
 register_shape_func("logical_not", False, elemwise_shape_func)
+register_shape_func("ceil", False, elemwise_shape_func)

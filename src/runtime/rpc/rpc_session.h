@@ -142,7 +142,7 @@ class RPCSession {
 
   /*!
    * \brief Free a remote function.
-   * \param handle The remote handle, can be NDArray/PackedFunc/Module
+   * \param handle The remote handle, can be NDArray/PackedFunc/Module/Object
    * \param type_code The type code of the underlying type.
    */
   virtual void FreeHandle(void* handle, int type_code) = 0;
@@ -253,6 +253,11 @@ class RPCSession {
    */
   static std::shared_ptr<RPCSession> Get(int table_index);
 
+  /*!
+   * \brief Shutdown RPC connection.
+   */
+  virtual void Shutdown() {}
+
  protected:
   /*!
    * \brief Send an exception to the callback.
@@ -283,27 +288,53 @@ struct RemoteSpace {
 };
 
 /*!
- * \brief Wrap a timer function to measure the time cost of a given packed function.
- * \param f The function argument.
- * \param dev The device.
- * \param number The number of times to run this function for taking average.
- *        We call these runs as one `repeat` of measurement.
- * \param repeat The number of times to repeat the measurement.
- *        In total, the function will be invoked (1 + number x repeat) times,
- *        where the first one is warm up and will be discarded.
- *        The returned result contains `repeat` costs,
- *        each of which is an average of `number` costs.
- * \param min_repeat_ms The minimum duration of one `repeat` in milliseconds.
- *        By default, one `repeat` contains `number` runs. If this parameter is set,
- *        the parameters `number` will be dynamically adjusted to meet the
- *        minimum duration requirement of one `repeat`.
- *        i.e., When the run time of one `repeat` falls below this time,
- *        the `number` parameter will be automatically increased.
- * \param f_preproc The function to be executed before we excetute time evaluator.
- * \return f_timer A timer function.
+ * \brief Object wrapper that represents a reference to a remote object
  */
-PackedFunc WrapTimeEvaluator(PackedFunc f, Device dev, int number, int repeat, int min_repeat_ms,
-                             PackedFunc f_preproc = nullptr);
+class RPCObjectRefObj : public Object {
+ public:
+  /*!
+   * \brief constructor
+   * \param object_handle handle that points to the remote object
+   * \param sess The remote session
+   */
+  RPCObjectRefObj(void* object_handle, std::shared_ptr<RPCSession> sess)
+      : object_handle_(object_handle), sess_(sess) {}
+
+  ~RPCObjectRefObj() {
+    if (object_handle_ != nullptr) {
+      try {
+        sess_->FreeHandle(object_handle_, kTVMObjectHandle);
+      } catch (const Error& e) {
+        // fault tolerance to remote close
+      }
+      object_handle_ = nullptr;
+    }
+  }
+
+  const std::shared_ptr<RPCSession>& sess() const { return sess_; }
+
+  void* object_handle() const { return object_handle_; }
+
+  static constexpr const uint32_t _type_index = TypeIndex::kRuntimeRPCObjectRef;
+  static constexpr const char* _type_key = "runtime.RPCObjectRef";
+  TVM_DECLARE_FINAL_OBJECT_INFO(RPCObjectRefObj, Object);
+
+ private:
+  // The object handle
+  void* object_handle_{nullptr};
+  // The local channel
+  std::shared_ptr<RPCSession> sess_;
+};
+
+/*!
+ * \brief Managed reference to RPCObjectRefObj.
+ * \sa RPCObjectRefObj
+ * \note No public constructor is provided as it is not supposed to be directly created by users.
+ */
+class RPCObjectRef : public ObjectRef {
+ public:
+  TVM_DEFINE_MUTABLE_NOTNULLABLE_OBJECT_REF_METHODS(RPCObjectRef, ObjectRef, RPCObjectRefObj);
+};
 
 /*!
  * \brief Create a Global RPC module that refers to the session.

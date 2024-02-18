@@ -20,24 +20,6 @@ import tvm
 from tvm import arith
 
 
-# TODO(@mbaret): Formalise this with a specification
-def get_weights_buffer(tir_extern_call):
-    """Get the weights pointer from a NPU extern call if it exists"""
-    supported_ops = ["ethosu_conv2d", "ethosu_depthwise_conv2d"]
-    if tir_extern_call.args[0] in supported_ops:
-        return tir_extern_call.args[41].buffer
-    return None
-
-
-# TODO(@mbaret): Formalise this with a specification
-def get_scale_bias_buffer(tir_extern_call):
-    """Get the scale_bias pointer from a NPU extern call if it exists"""
-    supported_ops = ["ethosu_conv2d", "ethosu_depthwise_conv2d"]
-    if tir_extern_call.args[0] in supported_ops:
-        return tir_extern_call.args[44].buffer
-    return None
-
-
 def get_op_attrs(stmt):
     """Iterate through nested attribute statements accumulating their values
     in an attribute dictionary.
@@ -174,6 +156,36 @@ def get_outer_loops(stmt, layout):
         b = w.body
         return n, h, w, cb, b, b.body
     return None
+
+
+def collect_buffer_map(stmt):
+    """Collect a map of Var -> Buffer
+
+    Generate a map from a buffer's backing `tir.Var` to the
+    `tir.Buffer` object that uses it.  If multiple such buffers exist,
+    return the first occurrence.
+
+    Parameters
+    ----------
+    stmt : tvm.tir.Stmt
+        The statement to get the BufferLoads from.
+
+    Returns
+    -------
+    buffer_map : Dict[Var, Buffer]
+        The map from buffer var to the buffers that use it.
+    """
+    buffer_map = {}
+
+    def _visit(node):
+        if isinstance(node, (tvm.tir.BufferLoad, tvm.tir.BufferStore)):
+            buf = node.buffer
+            if buf.data not in buffer_map:
+                buffer_map[buf.data] = buf
+
+    tvm.tir.stmt_functor.post_order_visit(stmt, _visit)
+
+    return buffer_map
 
 
 def get_loads(stmt):

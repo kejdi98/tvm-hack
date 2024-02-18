@@ -141,21 +141,20 @@ def check_gpu():
         )
 
 
-def check_build():
-    if (REPO_ROOT / "build").exists():
-        warnings.append(
-            "Existing build dir found may be interfering with the Docker "
-            "build (you may need to remove it)"
-        )
-
-
 def gen_name(s: str) -> str:
     # random 4 letters
     suffix = "".join([random.choice(string.ascii_lowercase) for i in range(5)])
     return f"{s}-{suffix}"
 
 
-def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], interactive: bool):
+def docker(
+    name: str,
+    image: str,
+    scripts: List[str],
+    env: Dict[str, str],
+    interactive: bool,
+    additional_flags: Optional[Dict[str, str]] = None,
+):
     """
     Invoke a set of bash scripts through docker/bash.sh
 
@@ -173,9 +172,11 @@ def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], inter
         "ci_cpu",
         # "ci_wasm",
         # "ci_i386",
-        "ci_qemu",
+        "ci_cortexm",
         "ci_arm",
         "ci_hexagon",
+        "ci_riscv",
+        "ci_adreno",
     }
 
     if image in sccache_images and os.getenv("USE_SCCACHE", "1") == "1":
@@ -186,18 +187,30 @@ def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], inter
         env["CC"] = "/opt/sccache/cc"
         env["CXX"] = "/opt/sccache/c++"
         env["SCCACHE_CACHE_SIZE"] = os.getenv("SCCACHE_CACHE_SIZE", "50G")
+        env["SCCACHE_SERVER_PORT"] = os.getenv("SCCACHE_SERVER_PORT", "4226")
+
+    env["PLATFORM"] = name
 
     docker_bash = REPO_ROOT / "docker" / "bash.sh"
 
-    command = [docker_bash, "--name", name]
+    command = [docker_bash]
+    if sys.stdout.isatty():
+        command.append("-t")
+
+    command.append("--name")
+    command.append(name)
     if interactive:
         command.append("-i")
-        command.append("-t")
         scripts = ["interact() {", "  bash", "}", "trap interact 0", ""] + scripts
 
     for key, value in env.items():
         command.append("--env")
         command.append(f"{key}={value}")
+
+    if additional_flags is not None:
+        for key, value in additional_flags.items():
+            command.append(key)
+            command.append(value)
 
     SCRIPT_DIR.mkdir(exist_ok=True)
 
@@ -222,37 +235,36 @@ def docker(name: str, image: str, scripts: List[str], env: Dict[str, str], inter
 
 def docs(
     tutorial_pattern: Optional[str] = None,
-    full: bool = False,
     cpu: bool = False,
+    full: bool = False,
     interactive: bool = False,
     skip_build: bool = False,
+    docker_image: Optional[str] = None,
 ) -> None:
     """
     Build the documentation from gallery/ and docs/. By default this builds only
-    the Python docs.
+    the Python docs without any tutorials.
 
     arguments:
-    full -- Build all language docs, not just Python
-    precheck -- Run Sphinx precheck script
-    tutorial-pattern -- Regex for which tutorials to execute when building docs (can also be set via TVM_TUTORIAL_EXEC_PATTERN)
-    cpu -- Run with the ci-cpu image and use CMake defaults for building TVM (if no GPUs are available)
+    full -- Build all language docs, not just Python (cannot be used with --cpu)
+    cpu -- Use the 'ci_cpu' Docker image (useful for building docs on a machine without a GPU)
+    tutorial-pattern -- Regex for which tutorials to execute when building docs (cannot be used with --cpu)
     skip_build -- skip build and setup scripts
     interactive -- start a shell after running build / test scripts
+    docker-image -- manually specify the docker image to use
     """
-    config = "./tests/scripts/task_config_build_gpu.sh"
     build_dir = get_build_dir("gpu")
-    if cpu and full:
-        clean_exit("--full cannot be used with --cpu")
 
     extra_setup = []
-    image = "ci_gpu"
+    image = "ci_gpu" if docker_image is None else docker_image
     if cpu:
-        image = "ci_cpu"
+        # TODO: Change this to tlcpack/docs once that is uploaded
+        image = "ci_cpu" if docker_image is None else docker_image
         build_dir = get_build_dir("cpu")
-        config = " && ".join(
+        config_script = " && ".join(
             [
-                "mkdir -p build",
-                "pushd build",
+                f"mkdir -p {build_dir}",
+                f"pushd {build_dir}",
                 "cp ../cmake/config.cmake .",
                 # The docs import tvm.micro, so it has to be enabled in the build
                 "echo set\(USE_MICRO ON\) >> config.cmake",
@@ -265,9 +277,9 @@ def docs(
         requirements = [
             "Sphinx==4.2.0",
             "tlcpack-sphinx-addon==0.2.1",
-            "synr==0.5.0",
             "image==1.5.33",
-            "sphinx-gallery==0.4.0",
+            # Temporary git link until a release is published
+            "git+https://github.com/sphinx-gallery/sphinx-gallery.git@6142f1791151849b5bec4bf3959f75697ba226cd",
             "sphinx-rtd-theme==1.0.0",
             "matplotlib==3.3.4",
             "commonmark==0.9.1",
@@ -277,15 +289,15 @@ def docs(
         ]
 
         extra_setup = [
-            "python3 -m pip install --user " + " ".join(requirements),
+            "python3 -m pip install " + " ".join(requirements),
         ]
     else:
         check_gpu()
+        config_script = f"./tests/scripts/task_config_build_gpu.sh {build_dir}"
 
     scripts = extra_setup + [
-        config + f" {build_dir}",
+        config_script,
         f"./tests/scripts/task_build.py --build-dir {build_dir}",
-        "python3 -m pip install --user tlcpack-sphinx-addon==0.2.1 synr==0.6.0",
     ]
 
     if skip_build:
@@ -302,8 +314,14 @@ def docs(
         "IS_LOCAL": "1",
         "TVM_LIBRARY_PATH": str(REPO_ROOT / build_dir),
     }
-    check_build()
     docker(name=gen_name("docs"), image=image, scripts=scripts, env=env, interactive=interactive)
+    print_color(
+        col.GREEN,
+        "Done building the docs. You can view them by running "
+        "'python3 tests/scripts/ci.py serve-docs' and visiting:"
+        " http://localhost:8000 in your browser.",
+        bold=True,
+    )
 
 
 def serve_docs(directory: str = "_docs") -> None:
@@ -319,13 +337,14 @@ def serve_docs(directory: str = "_docs") -> None:
     cmd([sys.executable, "-m", "http.server"], cwd=directory_path)
 
 
-def lint(interactive: bool = False, fix: bool = False) -> None:
+def lint(interactive: bool = False, fix: bool = False, docker_image: Optional[str] = None) -> None:
     """
     Run CI's Sanity Check step
 
     arguments:
     interactive -- start a shell after running build / test scripts
     fix -- where possible (currently black and clang-format) edit files in place with formatting fixes
+    docker-image -- manually specify the docker image to use
     """
     env = {}
     if fix:
@@ -334,7 +353,7 @@ def lint(interactive: bool = False, fix: bool = False) -> None:
 
     docker(
         name=gen_name(f"ci-lint"),
-        image="ci_lint",
+        image="ci_lint" if docker_image is None else docker_image,
         scripts=["./tests/scripts/task_lint.sh"],
         env=env,
         interactive=interactive,
@@ -349,6 +368,8 @@ def generate_command(
     options: Dict[str, Option],
     help: str,
     precheck: Optional[Callable[[], None]] = None,
+    post_build: Optional[List[str]] = None,
+    additional_flags: Optional[Dict[str, str]] = None,
 ):
     """
     Helper to generate CLIs that:
@@ -359,27 +380,36 @@ def generate_command(
     """
 
     def fn(
-        tests: Optional[List[str]], skip_build: bool = False, interactive: bool = False, **kwargs
+        tests: Optional[List[str]],
+        skip_build: bool = False,
+        interactive: bool = False,
+        docker_image: Optional[str] = None,
+        verbose: bool = False,
+        **kwargs,
     ) -> None:
         """
         arguments:
         tests -- pytest test IDs (e.g. tests/python or tests/python/a_file.py::a_test[param=1])
         skip_build -- skip build and setup scripts
         interactive -- start a shell after running build / test scripts
+        docker-image -- manually specify the docker image to use
+        verbose -- run verbose build
         """
         if precheck is not None:
             precheck()
+
+        build_dir = get_build_dir(name)
 
         if skip_build:
             scripts = []
         else:
             scripts = [
-                f"./tests/scripts/task_config_build_{name}.sh {get_build_dir(name)}",
-                f"./tests/scripts/task_build.py --build-dir {get_build_dir(name)}",
-                # This can be removed once https://github.com/apache/tvm/pull/10257
-                # is merged and added to the Docker images
-                "python3 -m pip install --user tlcpack-sphinx-addon==0.2.1 synr==0.6.0",
+                f"./tests/scripts/task_config_build_{name}.sh {build_dir}",
+                f"./tests/scripts/task_build.py --build-dir {build_dir}",
             ]
+
+        if post_build is not None:
+            scripts += post_build
 
         # Check that a test suite was not used alongside specific test names
         if any(v for v in kwargs.values()) and tests is not None:
@@ -392,19 +422,21 @@ def generate_command(
         # Add named test suites
         for option_name, (_, extra_scripts) in options.items():
             if kwargs.get(option_name, False):
-                scripts += extra_scripts
+                scripts.extend(script.format(build_dir=build_dir) for script in extra_scripts)
 
         docker(
             name=gen_name(f"ci-{name}"),
-            image=f"ci_{name}",
+            image=f"ci_{name}" if docker_image is None else docker_image,
             scripts=scripts,
             env={
                 # Need to specify the library path manually or else TVM can't
                 # determine which build directory to use (i.e. if there are
                 # multiple copies of libtvm.so laying around)
                 "TVM_LIBRARY_PATH": str(REPO_ROOT / get_build_dir(name)),
+                "VERBOSE": "true" if verbose else "false",
             },
             interactive=interactive,
+            additional_flags=additional_flags,
         )
 
     fn.__name__ = name
@@ -428,7 +460,7 @@ def check_arm_qemu() -> None:
                 """
         You must run a one-time setup to use ARM containers on x86 via QEMU:
 
-            sudo apt install -y sudo apt-get install qemu binfmt-support qemu-user-static
+            sudo apt install -y qemu binfmt-support qemu-user-static
             docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
         See https://www.stereolabs.com/docs/docker/building-arm-container-on-x86/ for details""".strip(
@@ -528,7 +560,7 @@ def add_subparser(
             kwargs["required"] = not is_optional and not has_default
 
         if str(arg_type).startswith("typing.List"):
-            kwargs["nargs"] = "+"
+            kwargs["action"] = "append"
 
         if arg_cli_name[0] not in seen_prefixes:
             subparser.add_argument(f"-{arg_cli_name[0]}", f"--{arg_cli_name}", **kwargs)
@@ -550,16 +582,20 @@ def add_subparser(
     return subparser
 
 
+CPP_UNITTEST = ("run c++ unitests", ["./tests/scripts/task_cpp_unittest.sh {build_dir}"])
+
 generated = [
     generate_command(
         name="gpu",
         help="Run GPU build and test(s)",
         options={
+            "cpp": CPP_UNITTEST,
             "topi": ("run topi tests", ["./tests/scripts/task_python_topi.sh"]),
             "unittest": (
                 "run unit tests",
                 [
                     "./tests/scripts/task_java_unittest.sh",
+                    "./tests/scripts/task_opencl_cpp_unittest.sh {build_dir}",
                     "./tests/scripts/task_python_unittest_gpuonly.sh",
                     "./tests/scripts/task_python_integration_gpuonly.sh",
                 ],
@@ -571,6 +607,7 @@ generated = [
         name="cpu",
         help="Run CPU build and test(s)",
         options={
+            "cpp": CPP_UNITTEST,
             "integration": (
                 "run integration tests",
                 ["./tests/scripts/task_python_integration.sh"],
@@ -587,9 +624,23 @@ generated = [
         },
     ),
     generate_command(
+        name="minimal",
+        help="Run minimal CPU build and test(s)",
+        options={
+            "cpp": CPP_UNITTEST,
+            "unittest": (
+                "run unit tests",
+                [
+                    "./tests/scripts/task_python_unittest.sh",
+                ],
+            ),
+        },
+    ),
+    generate_command(
         name="i386",
         help="Run i386 build and test(s)",
         options={
+            "cpp": CPP_UNITTEST,
             "integration": (
                 "run integration tests",
                 [
@@ -602,32 +653,37 @@ generated = [
     generate_command(
         name="wasm",
         help="Run WASM build and test(s)",
-        options={"test": ("run WASM tests", ["./tests/scripts/task_web_wasm.sh"])},
+        options={
+            "cpp": CPP_UNITTEST,
+            "test": ("run WASM tests", ["./tests/scripts/task_web_wasm.sh"]),
+        },
     ),
     generate_command(
-        name="qemu",
-        help="Run QEMU build and test(s)",
+        name="cortexm",
+        help="Run Cortex-M build and test(s)",
         options={
+            "cpp": CPP_UNITTEST,
             "test": (
                 "run microTVM tests",
                 [
                     "./tests/scripts/task_python_microtvm.sh",
                     "./tests/scripts/task_demo_microtvm.sh",
                 ],
-            )
+            ),
         },
     ),
     generate_command(
         name="hexagon",
         help="Run Hexagon build and test(s)",
+        post_build=["./tests/scripts/task_build_hexagon_api.sh --output build-hexagon"],
         options={
+            "cpp": CPP_UNITTEST,
             "test": (
                 "run Hexagon API/Python tests",
                 [
-                    "./tests/scripts/task_build_hexagon_api.sh",
                     "./tests/scripts/task_python_hexagon.sh",
                 ],
-            )
+            ),
         },
     ),
     generate_command(
@@ -635,13 +691,66 @@ generated = [
         help="Run ARM build and test(s) (native or via QEMU on x86)",
         precheck=check_arm_qemu,
         options={
+            "cpp": CPP_UNITTEST,
             "python": (
                 "run full Python tests",
                 [
                     "./tests/scripts/task_python_unittest.sh",
                     "./tests/scripts/task_python_arm_compute_library.sh",
                 ],
-            )
+            ),
+        },
+    ),
+    generate_command(
+        name="riscv",
+        help="Run RISC-V build and test(s)",
+        options={
+            "cpp": CPP_UNITTEST,
+            "python": (
+                "run full Python tests",
+                [
+                    "./tests/scripts/task_riscv_microtvm.sh",
+                ],
+            ),
+        },
+    ),
+    generate_command(
+        name="adreno",
+        help="Run Adreno build and test(s)",
+        post_build=["./tests/scripts/task_build_adreno_bins.sh"],
+        additional_flags={
+            "--volume": os.environ.get("ADRENO_OPENCL", "") + ":/adreno-opencl",
+            "--env": "ADRENO_OPENCL=/adreno-opencl",
+            "--net": "host",
+        },
+        options={
+            "test": (
+                "run Adreno API/Python tests",
+                [
+                    "./tests/scripts/task_python_adreno.sh " + os.environ.get("ANDROID_SERIAL", ""),
+                ],
+            ),
+            "benchmarks": (
+                "run Adreno Benchmarks (Native OpenCL, CLML SDK)",
+                [
+                    "./apps/benchmark/adreno/bench.sh texture "
+                    + os.environ.get("ANDROID_SERIAL", ""),
+                    "./apps/benchmark/adreno/bench.sh clml " + os.environ.get("ANDROID_SERIAL", ""),
+                ],
+            ),
+            "nativebenchmarks": (
+                "run Adreno Texture Benchmarks",
+                [
+                    "./apps/benchmark/adreno/bench.sh texture "
+                    + os.environ.get("ANDROID_SERIAL", ""),
+                ],
+            ),
+            "clmlbenchmarks": (
+                "run Adreno CLML SDK Benchmarks",
+                [
+                    "./apps/benchmark/adreno/bench.sh clml " + os.environ.get("ANDROID_SERIAL", ""),
+                ],
+            ),
         },
     ),
 ]

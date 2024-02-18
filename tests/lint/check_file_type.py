@@ -32,6 +32,8 @@ ALLOW_EXTENSION = {
     "g4",
     "gradle",
     "js",
+    "cjs",
+    "mjs",
     "tcl",
     "scala",
     "java",
@@ -44,6 +46,7 @@ ALLOW_EXTENSION = {
     "pyd",
     "pyx",
     "cu",
+    "cuh",
     "bat",
     # relay text format
     "rly",
@@ -89,6 +92,10 @@ ALLOW_EXTENSION = {
     "ld",
     # Jinja2 templates
     "j2",
+    # Jenkinsfiles
+    "groovy",
+    # Python-parseable config files
+    "ini",
 }
 
 # List of file names allowed
@@ -100,6 +107,7 @@ ALLOW_FILE_NAME = {
     "Makefile",
     "Doxyfile",
     "pylintrc",
+    "condarc",
     "rat-excludes",
     "log4j.properties",
     ".clang-format",
@@ -107,6 +115,7 @@ ALLOW_FILE_NAME = {
     "CODEOWNERSHIP",
     ".scalafmt.conf",
     "Cargo.lock",
+    "poetry.lock",
     "with_the_same_user",
 }
 
@@ -125,6 +134,7 @@ ALLOW_SPECIFIC_FILE = {
     "apps/wasm-standalone/wasm-graph/.cargo/config",
     # html for demo purposes
     "web/apps/browser/rpc_server.html",
+    "web/apps/browser/rpc_plugin.html",
     # images are normally not allowed
     # discuss with committers before add more images
     "apps/android_rpc/app/src/main/res/mipmap-hdpi/ic_launcher.png",
@@ -139,7 +149,6 @@ ALLOW_SPECIFIC_FILE = {
     "tests/micro/testdata/mnist/digit-2.jpg",
     "tests/micro/testdata/mnist/digit-9.jpg",
     "tests/micro/testdata/mnist/mnist-8.onnx",
-    "tests/micro/testdata/kws/yes_no.tflite",
     # microTVM Zephyr runtime
     "apps/microtvm/zephyr/template_project/CMakeLists.txt.template",
     "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-arm",
@@ -147,13 +156,20 @@ ALLOW_SPECIFIC_FILE = {
     "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-i386",
     "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-riscv32",
     "apps/microtvm/zephyr/template_project/qemu-hack/qemu-system-riscv64",
+    "apps/microtvm/zephyr/template_project/fvp-hack/FVP_Corstone_SSE-300_Ethos-U55",
+    "apps/microtvm/zephyr/template_project/app-overlay/nucleo_l4r5zi.overlay",
+    # microTVM Arduino runtime
+    "apps/microtvm/arduino/template_project/Makefile.template",
+    # microTVM CRT
+    "src/runtime/crt/crt_config.h.template",
+    "src/runtime/crt/host/CMakeLists.txt.template",
     # microTVM Virtual Machines
-    "apps/microtvm/reference-vm/arduino/Vagrantfile",
-    "apps/microtvm/reference-vm/arduino/base-box/Vagrantfile.packer-template",
-    "apps/microtvm/reference-vm/zephyr/Vagrantfile",
-    "apps/microtvm/reference-vm/zephyr/base-box/Vagrantfile.packer-template",
+    "apps/microtvm/poetry.lock",
+    "apps/microtvm/reference-vm/Vagrantfile",
+    "apps/microtvm/reference-vm/base-box/Vagrantfile.packer-template",
     # Hexagon
     "src/runtime/hexagon/rpc/android_bash.sh.template",
+    "src/runtime/hexagon/profiler/lwp_handler.S",
 }
 
 
@@ -237,7 +253,7 @@ def main():
     if error_list:
         report = "------File type check report----\n"
         report += "\n".join(error_list)
-        report += "\nFound %d files that are now allowed\n" % len(error_list)
+        report += "\nFound %d files that are not allowed\n" % len(error_list)
         report += (
             "We do not check in binary files into the repo.\n"
             "If necessary, please discuss with committers and"

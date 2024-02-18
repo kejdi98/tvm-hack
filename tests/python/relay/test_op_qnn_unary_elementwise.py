@@ -21,7 +21,9 @@ import numpy as np
 import pytest
 import scipy.special
 import tvm
+import tvm.testing
 from tvm import relay
+from tvm.relay.qnn.op.legalizations import hardswish_func
 
 
 def dequantize(data, scale, zp):
@@ -129,7 +131,7 @@ class TestRSqrt:
         # Same qparams in and out
         x_data = np.array((255, 133, 0, 9)).reshape((1, 4))
         run_condition(
-            relay.qnn.op.rsqrt,
+            relay.qnn.rsqrt,
             lambda x: 1 / np.sqrt(x),
             x_data,
             input_scale=0.125,
@@ -141,7 +143,7 @@ class TestRSqrt:
 
         # Different scale
         run_condition(
-            relay.qnn.op.rsqrt,
+            relay.qnn.rsqrt,
             lambda x: 1 / np.sqrt(x),
             x_data,
             input_scale=0.125,
@@ -152,11 +154,11 @@ class TestRSqrt:
         )
 
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.rsqrt, lambda x: 1 / np.sqrt(x), input_dtype="uint8")
+        generic_test(relay.qnn.rsqrt, lambda x: 1 / np.sqrt(x), input_dtype="uint8")
 
     def test_all_numbers_int8(self):
         generic_test(
-            relay.qnn.op.rsqrt,
+            relay.qnn.rsqrt,
             lambda x: 1 / np.sqrt(x),
             input_dtype="int8",
             x_data=np.arange(1, 128, dtype="int8"),
@@ -165,11 +167,11 @@ class TestRSqrt:
 
 class Sqrt:
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.sqrt, np.sqrt, input_dtype="uint8")
+        generic_test(relay.qnn.sqrt, np.sqrt, input_dtype="uint8")
 
     def test_all_numbers_int8(self):
         generic_test(
-            relay.qnn.op.sqrt,
+            relay.qnn.sqrt,
             np.sqrt,
             input_dtype="int8",
             x_data=np.arange(1, 128, dtype="int8"),
@@ -178,37 +180,43 @@ class Sqrt:
 
 class TestExp:
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.exp, np.exp, input_dtype="uint8")
+        generic_test(relay.qnn.exp, np.exp, input_dtype="uint8")
 
     def test_all_numbers_int8(self):
-        generic_test(relay.qnn.op.exp, np.exp, input_dtype="int8")
+        generic_test(relay.qnn.exp, np.exp, input_dtype="int8")
 
 
 class TestTanh:
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.tanh, np.tanh, input_dtype="uint8")
+        generic_test(relay.qnn.tanh, np.tanh, input_dtype="uint8")
 
     def test_all_numbers_int8(self):
-        generic_test(relay.qnn.op.tanh, np.tanh, input_dtype="int8")
+        generic_test(relay.qnn.tanh, np.tanh, input_dtype="int8")
 
 
 class TestErf:
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.erf, scipy.special.erf, input_dtype="uint8")
+        generic_test(relay.qnn.erf, scipy.special.erf, input_dtype="uint8")
 
     def test_all_numbers_int8(self):
-        generic_test(relay.qnn.op.erf, scipy.special.erf, input_dtype="int8")
+        generic_test(relay.qnn.erf, scipy.special.erf, input_dtype="int8")
 
 
 class TestSigmoid:
     def test_all_numbers_uint8(self):
-        generic_test(relay.qnn.op.sigmoid, lambda x: 1 / (1 + np.exp(-x)), input_dtype="uint8")
+        generic_test(relay.qnn.sigmoid, lambda x: 1 / (1 + np.exp(-x)), input_dtype="uint8")
 
     def test_all_numbers_int8(self):
-        generic_test(relay.qnn.op.sigmoid, lambda x: 1 / (1 + np.exp(-x)), input_dtype="int8")
+        generic_test(relay.qnn.sigmoid, lambda x: 1 / (1 + np.exp(-x)), input_dtype="int8")
+
+
+class TestHardswish:
+    def test_all_numbers_uint8(self):
+        generic_test(relay.qnn.hardswish, hardswish_func, input_dtype="uint8")
+
+    def test_all_numbers_int8(self):
+        generic_test(relay.qnn.hardswish, hardswish_func, input_dtype="int8")
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
+    tvm.testing.main()

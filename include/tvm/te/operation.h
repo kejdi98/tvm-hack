@@ -47,7 +47,7 @@ struct TensorDom {
   // constructor
   explicit TensorDom(int ndim) : data(ndim) {}
   /*! \brief The domain data */
-  std::vector<std::vector<IntSet> > data;
+  std::vector<std::vector<IntSet>> data;
 };
 
 /*!
@@ -182,7 +182,7 @@ class PlaceholderOpNode : public OperationNode {
   }
 
   static constexpr const char* _type_key = "PlaceholderOp";
-  TVM_DECLARE_FINAL_OBJECT_INFO(PlaceholderOpNode, OperationNode);
+  TVM_DECLARE_BASE_OBJECT_INFO(PlaceholderOpNode, OperationNode);
 };
 
 /*!

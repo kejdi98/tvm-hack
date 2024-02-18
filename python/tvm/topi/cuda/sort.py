@@ -120,7 +120,6 @@ def _odd_even_sort(
     values=None,
     values_swap=None,
 ):
-
     nthread_tx = block_size // 2
     nthread_bx = ceil_div(size, block_size)
     nthread_by = axis_mul_before
@@ -736,7 +735,7 @@ def sort_thrust(data, axis=-1, is_ascend=1):
 
 
 def argsort(data, axis=-1, is_ascend=1, dtype="float32", ret_type="indices"):
-    """Performs sorting along the given axis and returns an array of indicies
+    """Performs sorting along the given axis and returns an array of indices
     having same shape as an input array that index data in sorted order.
 
     Parameters
@@ -803,7 +802,7 @@ def argsort(data, axis=-1, is_ascend=1, dtype="float32", ret_type="indices"):
 
 
 def argsort_thrust(data, axis=-1, is_ascend=1, dtype="float32", ret_type="indices"):
-    """Performs sorting along the given axis and returns an array of indicies
+    """Performs sorting along the given axis and returns an array of indices
     having same shape as an input array that index data in sorted order.
 
     Parameters

@@ -24,14 +24,38 @@
 #include <tvm/te/tensor.h>
 #include <tvm/tir/function.h>
 
+#include <optional>
+
 namespace tvm {
 namespace tir {
 
 /*! \brief Use Tensor Expression to create a schedulable TensorIR func. */
-PrimFunc CreatePrimFunc(const Array<te::Tensor>& arg_list);
+PrimFunc CreatePrimFunc(const Array<te::Tensor>& arg_list,
+                        std::optional<DataType> index_dtype_override = std::nullopt);
 
-/*! \brief Create a schedulable TensorIR func from TE compute outputs. */
-PrimFunc CreatePrimFuncFromOutputs(const Array<te::Tensor>& outputs);
+/*! \brief The same as above but create a PrimFunc with AllocateConstNode. If the size of the
+ * constants array is N, the last N tensors in arg_list will be treated as constant tensors.
+ * Constant tensors will not be part of the parameters of the created PrimFunc, instead constants
+ * will be embedded in the body as AllocateConstNode.
+ */
+PrimFunc CreatePrimFuncWithConstants(const Array<te::Tensor>& arg_list,
+                                     const Array<runtime::NDArray>& constants,
+                                     std::optional<DataType> index_dtype_override = std::nullopt);
+
+// Relax version
+// TODO(relax-team) combine with the relay version
+/*! \brief Use Tensor Expression to create a schedulable TensorIR func. */
+PrimFunc CreatePrimFunc(const Array<ObjectRef>& arg_list,
+                        std::optional<DataType> index_dtype_override);
+
+/*! \brief The same as above but create a PrimFunc with AllocateConstNode. If the size of the
+ * constants array is N, the last N tensors in arg_list will be treated as constant tensors.
+ * Constant tensors will not be part of the parameters of the created PrimFunc, instead constants
+ * will be embedded in the body as AllocateConstNode.
+ */
+PrimFunc CreatePrimFuncWithConstants(const Array<ObjectRef>& arg_list,
+                                     const Array<runtime::NDArray>& constants,
+                                     std::optional<DataType> index_dtype_override);
 
 }  // namespace tir
 }  // namespace tvm

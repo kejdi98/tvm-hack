@@ -25,9 +25,9 @@
 #ifndef TVM_RELAY_EXPR_FUNCTOR_H_
 #define TVM_RELAY_EXPR_FUNCTOR_H_
 
-#include <tvm/ir/error.h>
 #include <tvm/node/functor.h>
 #include <tvm/relay/adt.h>
+#include <tvm/relay/error.h>
 #include <tvm/relay/expr.h>
 #include <tvm/relay/function.h>
 #include <tvm/relay/op.h>
@@ -239,6 +239,8 @@ class MixedModeVisitor : public ::tvm::relay::ExprVisitor {
    * higher (i.e., 2 for dead code elimiation), limited to 10 as a sanity check.
    */
   explicit MixedModeVisitor(int visit_limit = 1);
+
+  using ExprVisitor::VisitExpr_;
 
   /*!
    * \brief VisitExpr is finalized to preserve call expansion of dataflow regions

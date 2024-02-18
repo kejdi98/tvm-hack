@@ -729,7 +729,7 @@ def InjectConv2DTransposeSkip():
 
         def _do_fold(op):
             if _match_pragma(op, "conv2d_transpose_gemm"):
-                is_init = ".init" in str(op)
+                is_init = "_init" in str(op)
                 tvm.tir.stmt_functor.post_order_visit(op, _find_basics)
 
                 if is_init:
@@ -902,9 +902,6 @@ def InjectALUIntrin():
         analyzer = tvm.arith.Analyzer()
 
         def _do_fold(stmt):
-            def _equal(x, y):
-                return tvm.ir.structural_equal(analyzer.simplify(x - y), 0)
-
             def _flatten_loop(src_coeff, dst_coeff, extents):
                 src_coeff = list(src_coeff)
                 dst_coeff = list(dst_coeff)
@@ -921,7 +918,9 @@ def InjectALUIntrin():
                     next_dst = dst_coeff.pop()
                     next_ext = extents.pop()
 
-                    if _equal(next_src, vsrc * vext) and _equal(next_dst, vdst * vext):
+                    if analyzer.can_prove_equal(next_src, vsrc * vext) and analyzer.can_prove_equal(
+                        next_dst, vdst * vext
+                    ):
                         vext = analyzer.simplify(vext * next_ext)
                     else:
                         rev_src_coeff.append(vsrc)
@@ -989,7 +988,7 @@ def InjectALUIntrin():
                         rhs = loop_body.value.args[1]
                     else:
                         raise RuntimeError(
-                            "Function call not recognized %s" % (loop_body.value.name)
+                            "Function call not recognized %s" % (loop_body.value.op.name)
                         )
                 elif isinstance(loop_body.value, tvm.tir.BufferLoad):
                     alu_opcode = env.dev.ALU_OPCODE_SHR

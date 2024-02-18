@@ -53,11 +53,53 @@ def test_target_to_argparse_known_codegen():
     assert parsed.target_cmsis_nn_mcpu == "cortex-m3"
 
 
+@tvm.testing.requires_mrvl
+def test_target_to_argparse_for_mrvl_hybrid():
+    parser = argparse.ArgumentParser()
+    generate_target_args(parser)
+    parsed, _ = parser.parse_known_args(
+        [
+            "--target=mrvl, llvm",
+            "--target-mrvl-mattr=wb_pin_ocm=1,quantize=fp16",
+            "--target-mrvl-num_tiles=2",
+            "--target-mrvl-mcpu=cnf10kb",
+        ]
+    )
+
+    assert parsed.target == "mrvl, llvm"
+    assert parsed.target_mrvl_mattr == "wb_pin_ocm=1,quantize=fp16"
+    assert parsed.target_mrvl_num_tiles == 2
+    assert parsed.target_mrvl_mcpu == "cnf10kb"
+
+
 def test_mapping_target_args():
     parser = argparse.ArgumentParser()
     generate_target_args(parser)
     parsed, _ = parser.parse_known_args(["--target=llvm", "--target-llvm-mcpu=cortex-m3"])
     assert reconstruct_target_args(parsed) == {"llvm": {"mcpu": "cortex-m3"}}
+
+
+@tvm.testing.requires_vitis_ai
+def test_composite_target_cmd_line_help():
+    parser = argparse.ArgumentParser()
+    generate_target_args(parser)
+    assert parser._option_string_actions["--target-vitis-ai-dpu"].help == "Vitis AI DPU identifier"
+    assert (
+        parser._option_string_actions["--target-vitis-ai-build_dir"].help
+        == "Build directory to be used (optional, debug)"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-work_dir"].help
+        == "Work directory to be used (optional, debug)"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-export_runtime_module"].help
+        == "Export the Vitis AI runtime module to this file"
+    )
+    assert (
+        parser._option_string_actions["--target-vitis-ai-load_runtime_module"].help
+        == "Load the Vitis AI runtime module to this file"
+    )
 
 
 @tvm.testing.requires_cmsisnn
@@ -70,6 +112,20 @@ def test_include_known_codegen():
     assert reconstruct_target_args(parsed) == {
         "c": {"mcpu": "cortex-m55"},
         "cmsis-nn": {"mcpu": "cortex-m55"},
+    }
+
+
+@tvm.testing.requires_ethosu
+def test_ethosu_compiler_attrs():
+    # It is checked that the represented string and boolean types in the
+    # EthosUCompilerConfigNode structure can be passed via the command line
+    parser = argparse.ArgumentParser()
+    generate_target_args(parser)
+    parsed, _ = parser.parse_known_args(
+        ["--target-ethos-u-accelerator_config=ethos-u55-32", "--target-ethos-u-enable_cascader=1"]
+    )
+    assert reconstruct_target_args(parsed) == {
+        "ethos-u": {"accelerator_config": "ethos-u55-32", "enable_cascader": 1},
     }
 
 
@@ -86,7 +142,7 @@ def test_skip_target_from_codegen():
 def test_target_recombobulation_single():
     tvm_target, _ = target_from_cli("llvm", {"llvm": {"mcpu": "cortex-m3"}})
 
-    assert str(tvm_target) == "llvm -keys=cpu -link-params=0 -mcpu=cortex-m3"
+    assert str(tvm_target) == "llvm -keys=arm_cpu,cpu -mcpu=cortex-m3"
 
 
 def test_target_recombobulation_many():

@@ -69,7 +69,7 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding packed function.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
   /*!
    * \brief Using the global input name to get the index, and also get the input interface name
      of corresponding subgraph from the input connection configuration.
@@ -115,6 +115,7 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
   int NumOutputs() const { return num_outputs_; }
   /*!\brief Run the pipeline executor.*/
   void Run();
+  int NumInputs();
   /*!
    * \brief Get a list output data.
    * \return A list of output data.

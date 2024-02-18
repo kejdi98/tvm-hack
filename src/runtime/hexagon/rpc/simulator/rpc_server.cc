@@ -18,16 +18,19 @@
  */
 
 #include <HAP_farf.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <string>
 
 #include "../../../library_module.h"
 #include "../../../minrpc/minrpc_server.h"
-#include "../../hexagon/hexagon_common.h"
+#include "../../hexagon_common.h"
+#include "../../profiler/prof_utils.h"
 #include "hexagon_sim_proto.h"
 #include "tvm/runtime/packed_func.h"
 #include "tvm/runtime/registry.h"
@@ -76,7 +79,7 @@ class stringbuf_with_remote_access : public std::stringbuf {
       remaining--;
     } while (remaining > 0);
 
-    // This will return 0 on success, non-zero if underflow occured.
+    // This will return 0 on success, non-zero if underflow occurred.
     return size - remaining;
   }
 };
@@ -288,10 +291,19 @@ int DISPATCH_FUNCTION_NAME(void* serverp) {
   return 0;
 }
 
-int main() {
-  const auto* api_v2 = tvm::runtime::Registry::Get("device_api.hexagon.v2");
-  ICHECK(api_v2 != nullptr);
-  tvm::runtime::Registry::Register("device_api.hexagon", true).set_body(*api_v2);
+int main(int argc, char* argv[]) {
+  // Load C++RT and ourselves as "global" to make all the symbols defined
+  // there be visible to any subsequent libraries loaded via dlopen.
+  void* cxx_abi = dlopen("libc++abi.so", RTLD_GLOBAL);
+  ICHECK(cxx_abi != nullptr);
+  void* cxx = dlopen("libc++.so", RTLD_GLOBAL);
+  ICHECK(cxx != nullptr);
+  void* self = dlopen(argv[0], RTLD_GLOBAL);
+  ICHECK(self != nullptr);
+
+  const auto* api = tvm::runtime::Registry::Get("device_api.hexagon");
+  ICHECK(api != nullptr);
+  tvm::runtime::Registry::Register("device_api.cpu", true).set_body(*api);
 
   tvm::runtime::hexagon::SimulatorRPCServer server;
 
@@ -308,6 +320,9 @@ int main() {
     // nothing
   }
 
+  dlclose(self);
+  dlclose(cxx);
+  dlclose(cxx_abi);
   return 0;
 }
 
@@ -322,4 +337,29 @@ TVM_REGISTER_GLOBAL("tvm.hexagon.load_module")
       std::string soname = args[0];
       tvm::ObjectPtr<tvm::runtime::Library> n = tvm::runtime::CreateDSOLibraryObject(soname);
       *rv = CreateModuleFromLibrary(n);
+    });
+
+TVM_REGISTER_GLOBAL("tvm.hexagon.get_profile_output")
+    .set_body([](tvm::runtime::TVMArgs args, tvm::runtime::TVMRetValue* rv) {
+      std::string profiling_mode = args[0];
+      std::string out_file = args[1];
+      if (profiling_mode.compare("lwp") == 0) {
+        *rv = WriteLWPOutput(out_file);
+      } else {
+        HEXAGON_PRINT(ERROR, "ERROR: Unsupported profiling mode: %s", profiling_mode.c_str());
+        *rv = false;
+      }
+    });
+
+void SaveBinaryToFile(const std::string& file_name, const std::string& data) {
+  std::ofstream fs(file_name, std::ios::out | std::ios::binary);
+  ICHECK(!fs.fail()) << "Cannot open " << file_name;
+  fs.write(&data[0], data.length());
+}
+
+TVM_REGISTER_GLOBAL("tvm.rpc.server.upload")
+    .set_body([](tvm::runtime::TVMArgs args, tvm::runtime::TVMRetValue* rv) {
+      std::string file_name = args[0];
+      std::string data = args[1];
+      SaveBinaryToFile(file_name, data);
     });

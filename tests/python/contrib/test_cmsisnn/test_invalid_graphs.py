@@ -16,35 +16,29 @@
 # under the License.
 
 """CMSIS-NN integration tests: Tests invalid graphs"""
-import itertools
 import numpy as np
-import pytest
 import tvm
-from tvm import relay
 
-
-from tests.python.relay.aot.aot_test_utils import (
-    AOTTestModel,
+from tvm.testing.aot import AOTTestModel, get_dtype_range, compile_and_run, generate_ref_data
+from tvm.micro.testing.aot_test_utils import (
     AOT_USMP_CORSTONE300_RUNNER,
-    generate_ref_data,
-    compile_and_run,
 )
-from utils import (
+from .utils import (
     skip_if_no_reference_system,
-    get_range_for_dtype_str,
 )
 
 
 @skip_if_no_reference_system
 @tvm.testing.requires_cmsisnn
 def test_empty_function():
-    ORIGINAL_MODEL = """
+    """Test partitioned function without composite function"""
+    original_model = """
 #[version = "0.0.5"]
 def @main(%data : Tensor[(16, 29), int8]) -> Tensor[(16, 29), int8] {
     add(%data, %data)
 }
 """
-    CMSISNN_MODEL = """
+    cmsisnn_model = """
 #[version = "0.0.5"]
 def @tvmgen_default_cmsis_nn_main_1(%i1: Tensor[(16, 29), int8], Inline=1, Compiler="cmsis-nn", global_symbol="tvmgen_default_cmsis_nn_main_1", Primitive=1) -> Tensor[(16, 29), int8] {
   add(%i1, %i1)
@@ -54,8 +48,8 @@ def @main(%data : Tensor[(16, 29), int8]) -> Tensor[(16, 29), int8] {
   %1
 }
 """
-    orig_mod = tvm.parser.fromtext(ORIGINAL_MODEL)
-    cmsisnn_mod = tvm.parser.fromtext(CMSISNN_MODEL)
+    orig_mod = tvm.relay.fromtext(original_model)
+    cmsisnn_mod = tvm.relay.fromtext(cmsisnn_model)
     params = {}
 
     # validate the output
@@ -63,7 +57,7 @@ def @main(%data : Tensor[(16, 29), int8]) -> Tensor[(16, 29), int8] {
     use_unpacked_api = True
     test_runner = AOT_USMP_CORSTONE300_RUNNER
     dtype = "int8"
-    in_min, in_max = get_range_for_dtype_str(dtype)
+    in_min, in_max = get_dtype_range(dtype)
     rng = np.random.default_rng(12345)
     inputs = {"data": rng.integers(in_min, high=in_max, size=(16, 29), dtype=dtype)}
     outputs = generate_ref_data(orig_mod["main"], inputs, params)

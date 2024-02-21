@@ -30,10 +30,11 @@ from ....tir import expr
 from ...transform import LayoutConfig
 from .. import op as reg
 from .. import strategy
+from ..op import OpPattern
 from .._tensor import elemwise_shape_func
 from ..strategy.generic import is_depthwise_conv2d
 
-def truncuate_max(x: relay.expr.Call, th=127, dtype="int8"):
+""" def truncuate_max(x: relay.expr.Call, th=127, dtype="int8"):
     zeros = relay.zeros_like(x)
     threashold = relay.ones_like(x) * relay.const(th, dtype=dtype)
     # return relay.greater(x, threashold)
@@ -41,22 +42,21 @@ def truncuate_max(x: relay.expr.Call, th=127, dtype="int8"):
 
 def truncuate_min(x: relay.expr.Call, th=-128, dtype="int8"):
     threashold = relay.ones_like(x) * relay.const(th, dtype=dtype)
-    return relay.where(relay.less(x, threashold), threashold, x)
+    return relay.where(relay.less(x, threashold), threashold, x) """
 
-@reg.register_legalize("nn.mcutruncate", level=10)
+""" @reg.register_legalize("nn.mcutruncate", level=10)
 def mcu_nn_truncate(attrs, inputs, types):
     x = inputs[0]
     dtype = types[0].dtype
     int8_res = truncuate_max(x, th=127, dtype=dtype)
     int8_res = truncuate_min(int8_res, th=-128, dtype=dtype)
-    return relay.cast(int8_res, type[1].dtype)
+    return relay.cast(int8_res, types[1].dtype) """
 
 reg.register_pattern("nn.mcutruncate", OpPattern.OUT_ELEMWISE_FUSABLE)
-# reg.register_strategy("nn.mcutruncate", strategy.cumsum_strategy)
+reg.register_strategy("nn.mcutruncate", strategy.mcu_truncate_strategy)
 
 
-# reg.register_strategy("nn.mcuadd", strategy.naive_schedule)
-@reg.register_legalize("nn.mcuadd", level=10)
+""" @reg.register_legalize("nn.mcuadd", level=10)
 def mcu_nn_add(attrs, inputs, types):
     new_inputs = [relay.cast(_, "int32") for _ in inputs]
     x1, x2, zero_x1, zero_x2, scale_x1, scale_x2, zero_y, scale_y = new_inputs
@@ -70,13 +70,13 @@ def mcu_nn_add(attrs, inputs, types):
     out = x1 + x2
     int32_out = out / scale_y + zero_y
 
-    return relay.cast(int32_out, "int8")
+    return relay.cast(int32_out, "int8") """
+reg.register_pattern("nn.mcuadd", OpPattern.OUT_ELEMWISE_FUSABLE)
+reg.register_strategy("nn.mcuadd", strategy.mcu_add_strategy)
 
 # conv2d
-reg.register_strategy("nn.mcuconv2d", strategy.conv2d_strategy)
-reg.register_pattern("nn.mcuconv2d", OpPattern.OUT_ELEMWISE_FUSABLE)
 
-def truncuate(x: relay.expr.Call, th=127, dtype="int8"):
+""" def truncuate(x: relay.expr.Call, th=127, dtype="int8"):
     zeros = relay.zeros_like(x)
     threashold = relay.ones_like(x) * relay.const(th, dtype=dtype)
     return relay.where(relay.greater(x, threashold), threashold, x)
@@ -91,7 +91,10 @@ def mcu_nn_conv2d(attrs, inputs, types):
     scale = relay.reshape(scale, newshape=[1, -1, 1, 1])
     int32_out = conv_res * scale + zy
     int32_out = truncuate(int32_out)
-    return relay.cast(int32_out, "int8")
+    return relay.cast(int32_out, "int8") """
+
+reg.register_strategy("nn.mcuconv2d", strategy.mcu_conv2d_strategy)
+reg.register_pattern("nn.mcuconv2d", OpPattern.OUT_ELEMWISE_FUSABLE)
 
 # @reg.register_alter_op_layout("nn.mcuconv2d")
 # def alter_op_layout_conv2d(attrs, inputs, tinfos, out_type):

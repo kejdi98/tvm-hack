@@ -2095,3 +2095,54 @@ def wrap_compute_layout_transform(topi_compute, schedule_rule="None"):
         return [topi_compute(inputs[0], attrs.src_layout, attrs.dst_layout, schedule_rule)]
 
     return _compute_layout_transform
+
+@override_native_generic_func("mcuadd")
+def mcu_add_strategy(attrs, inputs, out_type, target):
+    """qnn.add strategy for Hexagon"""
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_compute(topi.hexagon.mcu_add),
+        wrap_topi_schedule(topi.hexagon.schedule_mcu_add),
+        name="mcu_add.generic",
+    )
+    return strategy
+
+@override_native_generic_func("mcutruncate")
+def mcu_truncate_strategy(attrs, inputs, out_type, target):
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_compute(topi.hexagon.mcu_truncate),
+        wrap_topi_schedule(topi.hexagon.schedule_mcu_truncate),
+        name="mcu_truncate.generic",
+    )
+    return strategy
+
+def wrap_topi_mcu_conv2d(topi_compute):
+    """Wrap TOPI compute which use conv2d attrs and output data type"""
+
+    def wrapper(attrs, inputs, out_type):
+        out_dtype = out_type.dtype
+        out_layout = out_type.shape
+        strides = attrs.strides
+        padding = attrs.padding
+        dilation = attrs.dilation
+        groups = attrs.groups
+        channels = attrs.channels
+        kernel_size = attrs.kernel_size
+        data_layout = attrs.data_layout
+        kernel_layout = attrs.kernel_layout
+        
+        args = [*inputs, strides, padding, dilation, groups, channels, kernel_size, data_layout, kernel_layout, out_layout, out_dtype]
+        return [topi_compute(*args)]
+
+    return wrapper
+
+@override_native_generic_func("mcuconv2d")
+def mcu_conv2d_strategy(attrs, inputs, out_type, target):
+    strategy = _op.OpStrategy()
+    strategy.add_implementation(
+        wrap_topi_mcu_conv2d(topi.hexagon.mcu_conv2d),
+        wrap_topi_schedule(topi.hexagon.schedule_mcu_conv2d),
+        name="mcu_conv2d.generic",
+    )
+    return strategy

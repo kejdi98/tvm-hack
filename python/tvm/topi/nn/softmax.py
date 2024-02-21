@@ -136,17 +136,6 @@ def log_softmax(x, axis=-1):
     output : tvm.te.Tensor
         N-D output with same shape
     """
-<<<<<<< HEAD
-    assert len(x.shape) == 2, "only support 2-dim log softmax"
-    # pylint: disable=R1714
-    assert axis == -1 or axis == len(x.shape) - 1, f"only support last axis log softmax, but get x: {x} axis: {axis} len_x_shape: {len(x.shape)}"
-    m, n = x.shape
-    k = te.reduce_axis((0, n), name="k")
-    max_elem = te.compute((m,), lambda i: tvm.te.max(x[i, k], axis=k))
-    k = te.reduce_axis((0, n), name="k")
-    expsum = te.compute((m,), lambda i: te.sum(te.exp(x[i, k] - max_elem[i]), axis=k))
-    return te.compute(x.shape, lambda i, j: x[i, j] - max_elem[i] - te.log(expsum[i]))
-=======
     shape = x.shape
     if axis < 0:
         axis = len(shape) + axis
@@ -182,4 +171,3 @@ def log_softmax(x, axis=-1):
         lambda *indices: _normalize(max_elem, expsum, *indices),
         attrs={"axis": axis},
     )
->>>>>>> upstream/main

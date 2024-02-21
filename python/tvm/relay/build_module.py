@@ -174,13 +174,8 @@ class BuildModule(object):
         # Get artifacts
         mod = self.get_module()
         params = self.get_params()
-<<<<<<< HEAD
-        executor_config = self.get_graph_json() if str(executor) == "graph" else None
-        
-=======
         executor_config = self.get_graph_json() if executor.name == "graph" else None
 
->>>>>>> upstream/main
         return executor_config, mod, params
 
     def optimize(self, mod, target=None, target_host=None, params=None):

@@ -1030,3 +1030,189 @@ def schedule_qnn_batch_matmul(outs):
         The computation schedule for the op.
     """
     return default_schedule(outs)
+
+def mcu_requantize(
+    data: te.Tensor, effective_scale, zero_y, axis=-1, out_dtype="int8"
+):
+    def _compute(*indices):
+        value = data(*indices)
+        escale = get_qnn_param(effective_scale, indices, axis)
+        val = te.add(te.round(te.multiply(escale, value)), zero_y)
+        #To be discussed if the saturation corresponds to truncate?
+        return saturate(val, out_dtype).astype(out_dtype)
+    return te.compute(data.shape, _compute, name="requantize")
+
+def schedule_mcu_requantize(outs):
+    """Schedule for qnn.requantize
+
+    Parameters
+    ----------
+    outs: Array of Tensor
+          The computation graph description of qnn.requantize
+          in the format of an array of tensors.
+
+    Returns
+    -------
+    sch: Schedule
+        The computation schedule for the op.
+    """
+    return default_schedule(outs)
+
+def mcu_conv2d(  # Conv2d inputs
+    data,
+    weight,
+    bias,
+    # Conv2d quantization params:
+    zero_x,
+    zero_y,
+    effective_scale,
+    strides,
+    padding,
+    dilation,
+    groups,
+    channels,
+    kernel_size,
+    data_layout,
+    kernel_layout,
+    oshape,
+    out_dtype,
+):
+    """Compute for qnn.conv2d with NCHW layout.
+
+    Output data type should be specified through the 'odtype' parameter. qnn.conv2d leverages int32
+    type to store intermediate results. If 'odtype' differs from int32, you need to specify
+    requantization parameters.
+    """
+    in_channel = data.shape[1]  # NCHW layout
+    kernel_height = weight.shape[2]  # OIHW layout
+    kernel_width = weight.shape[3]  # OIHW layout
+
+    height_stride, width_stride = strides
+    dilation_h, dilation_w = dilation
+
+    dilated_kernel_h = (kernel_height - 1) * dilation_h + 1
+    dilated_kernel_w = (kernel_width - 1) * dilation_w + 1
+
+    pad_top, pad_left, pad_down, pad_right = get_pad_tuple(
+        get_const_tuple(padding), (dilated_kernel_h, dilated_kernel_w)
+    )
+
+    # Subtract zero point from weights. axis=0 in get_qnn_param means 'O' dimension in "OIHW"
+    # weights layout.
+    """ weight = te.compute(
+        weight.shape,
+        lambda *indices: te.subtract(
+            weight(*indices), get_qnn_param(kernel_zero_point, indices, axis=0)
+        ),
+    ) """
+
+    # Subtract zero point from input and then do padding with 0 value
+    data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x))
+
+    # DOPAD
+    if pad_top != 0 or pad_down != 0 or pad_left != 0 or pad_right != 0:
+        pad_before = (0, 0, pad_top, pad_left)
+        pad_after = (0, 0, pad_down, pad_right)
+        data_pad = pad(data, pad_before, pad_after, name="data_pad")
+    else:
+        data_pad = data
+
+    ic = te.reduce_axis((0, in_channel), name="ic")
+    kh = te.reduce_axis((0, kernel_height), name="kh")
+    kw = te.reduce_axis((0, kernel_width), name="kw")
+
+    out = te.compute(
+        oshape,
+        lambda n, oc, oh, ow: te.sum(
+            data_pad[
+                n, ic, oh * height_stride + kh * dilation_h, ow * width_stride + kw * dilation_w
+            ].astype("int32")
+            * weight[oc, ic, kh, kw].astype("int32"),
+            axis=[ic, kh, kw],
+        ),
+    )
+
+    # Add bias
+    if bias is not None:
+        assert len(out.shape) == len(bias.shape)
+        assert bias.shape[2] == 1 and bias.shape[3] == 1
+        out = te.compute(out.shape, lambda n, c, h, w: out[n, c, h, w] + bias[n, c, 0, 0])
+
+    if effective_scale is not None:
+        # Now supported only scalar and 1D quantization parameters
+        assert len(effective_scale) == 0 or len(effective_scale) == 1
+        axis = -1
+        if len(effective_scale) == 1:
+            axis = 1  # Axis param should correspond to 'C' dimension.
+    out = mcu_requantize(
+        out,
+        effective_scale,
+        zero_y,
+        axis,
+        out_dtype,
+    )
+    return out
+
+def schedule_mcu_conv2d(outs):
+    """Schedule for qnn.conv2d
+
+    Parameters
+    ----------
+    outs: Array of Tensor
+          The computation graph description of qnn.conv2d
+          in the format of an array of tensors.
+
+    Returns
+    -------
+    sch: Schedule
+        The computation schedule for the op.
+    """
+    return default_schedule(outs)
+
+def mcu_add(x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y):
+    """Compute for qnn.add
+    TODO: support 'axis' argument.
+    """
+    return compute_qnn_binary_op(
+        x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y, topi.add
+    )
+
+def schedule_mcu_add(outs):
+    """Schedule for qnn.add
+
+    Parameters
+    ----------
+    outs: Array of Tensor
+          The computation graph description of qnn.add
+          in the format of an array of tensors.
+
+    Returns
+    -------
+    sch: Schedule
+        The computation schedule for the op.
+    """
+    return default_schedule(outs)
+
+def mcu_truncate(x1, min, max, out_dtype=""):
+    """Compute for qnn.add
+    TODO: support 'axis' argument.
+    """
+    return saturate(
+        x1, out_dtype
+    )
+
+def schedule_mcu_truncate(outs):
+    """Schedule for qnn.add
+
+    Parameters
+    ----------
+    outs: Array of Tensor
+          The computation graph description of qnn.add
+          in the format of an array of tensors.
+
+    Returns
+    -------
+    sch: Schedule
+        The computation schedule for the op.
+    """
+    return default_schedule(outs)

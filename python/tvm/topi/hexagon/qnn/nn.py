@@ -1031,32 +1031,6 @@ def schedule_qnn_batch_matmul(outs):
     """
     return default_schedule(outs)
 
-def mcu_requantize(
-    data: te.Tensor, effective_scale, zero_y, axis=-1, out_dtype="int8"
-):
-    def _compute(*indices):
-        value = data(*indices)
-        escale = get_qnn_param(effective_scale, indices, axis)
-        val = te.add(te.round(te.multiply(escale, value)), zero_y)
-        #To be discussed if the saturation corresponds to truncate?
-        return saturate(val, out_dtype).astype(out_dtype)
-    return te.compute(data.shape, _compute, name="requantize")
-
-def schedule_mcu_requantize(outs):
-    """Schedule for qnn.requantize
-
-    Parameters
-    ----------
-    outs: Array of Tensor
-          The computation graph description of qnn.requantize
-          in the format of an array of tensors.
-
-    Returns
-    -------
-    sch: Schedule
-        The computation schedule for the op.
-    """
-    return default_schedule(outs)
 
 def mcu_conv2d(  # Conv2d inputs
     data,
@@ -1074,7 +1048,7 @@ def mcu_conv2d(  # Conv2d inputs
     kernel_size,
     data_layout,
     kernel_layout,
-    oshape,
+    out_layout,
     out_dtype,
 ):
     """Compute for qnn.conv2d with NCHW layout.
@@ -1120,9 +1094,14 @@ def mcu_conv2d(  # Conv2d inputs
     ic = te.reduce_axis((0, in_channel), name="ic")
     kh = te.reduce_axis((0, kernel_height), name="kh")
     kw = te.reduce_axis((0, kernel_width), name="kw")
+    output_height = ((data.shape[2] + pad_top + pad_down - dilated_kernel_h) // height_stride) + 1
+    output_width = ((data.shape[3] + pad_left + pad_right - dilated_kernel_w) // width_stride) + 1
+    output_channels = weight.shape[0]
+    batch_size = data.shape[0]
+    output_shape = (batch_size, output_channels, output_height, output_width)
 
     out = te.compute(
-        oshape,
+        output_shape,
         lambda n, oc, oh, ow: te.sum(
             data_pad[
                 n, ic, oh * height_stride + kh * dilation_h, ow * width_stride + kw * dilation_w
@@ -1134,24 +1113,21 @@ def mcu_conv2d(  # Conv2d inputs
 
     # Add bias
     if bias is not None:
-        assert len(out.shape) == len(bias.shape)
-        assert bias.shape[2] == 1 and bias.shape[3] == 1
-        out = te.compute(out.shape, lambda n, c, h, w: out[n, c, h, w] + bias[n, c, 0, 0])
+        assert len(bias.shape) == 1
+        out = te.compute(out.shape, lambda n, c, h, w: out[n, c, h, w].astype("int32") + bias[c].astype("int32"))
 
     if effective_scale is not None:
         # Now supported only scalar and 1D quantization parameters
-        assert len(effective_scale) == 0 or len(effective_scale) == 1
+        assert len(effective_scale.shape) == 0 or len(effective_scale.shape) == 1
         axis = -1
-        if len(effective_scale) == 1:
+        if len(effective_scale.shape) == 1:
             axis = 1  # Axis param should correspond to 'C' dimension.
-    out = mcu_requantize(
-        out,
-        effective_scale,
-        zero_y,
-        axis,
-        out_dtype,
-    )
+            out = te.compute(out.shape, lambda n, c, h, w: saturate(te.add(te.round(effective_scale[c] * out[n, c, h, w]), zero_y), out_dtype).astype(out_dtype))
+            return out
+        else:
+            out = te.compute(out.shape, lambda *indices: saturate(te.add(te.round(effective_scale * out(*indices)), zero_y), out_dtype).astype(out_dtype))
     return out
+
 
 def schedule_mcu_conv2d(outs):
     """Schedule for qnn.conv2d

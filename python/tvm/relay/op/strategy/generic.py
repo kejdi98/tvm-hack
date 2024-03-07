@@ -2096,7 +2096,7 @@ def wrap_compute_layout_transform(topi_compute, schedule_rule="None"):
 
     return _compute_layout_transform
 
-@override_native_generic_func("mcuadd")
+@override_native_generic_func("mcu_add_strategy")
 def mcu_add_strategy(attrs, inputs, out_type, target):
     """qnn.add strategy for Hexagon"""
     strategy = _op.OpStrategy()
@@ -2107,7 +2107,7 @@ def mcu_add_strategy(attrs, inputs, out_type, target):
     )
     return strategy
 
-@override_native_generic_func("mcutruncate")
+@override_native_generic_func("mcu_truncate_strategy")
 def mcu_truncate_strategy(attrs, inputs, out_type, target):
     strategy = _op.OpStrategy()
     strategy.add_implementation(
@@ -2122,7 +2122,6 @@ def wrap_topi_mcu_conv2d(topi_compute):
 
     def wrapper(attrs, inputs, out_type):
         out_dtype = out_type.dtype
-        out_layout = out_type.shape
         strides = attrs.strides
         padding = attrs.padding
         dilation = attrs.dilation
@@ -2131,13 +2130,13 @@ def wrap_topi_mcu_conv2d(topi_compute):
         kernel_size = attrs.kernel_size
         data_layout = attrs.data_layout
         kernel_layout = attrs.kernel_layout
-        
+        out_layout = attrs.out_layout
         args = [*inputs, strides, padding, dilation, groups, channels, kernel_size, data_layout, kernel_layout, out_layout, out_dtype]
         return [topi_compute(*args)]
 
     return wrapper
 
-@override_native_generic_func("mcuconv2d")
+@override_native_generic_func("mcu_conv2d_strategy")
 def mcu_conv2d_strategy(attrs, inputs, out_type, target):
     strategy = _op.OpStrategy()
     strategy.add_implementation(

@@ -2096,22 +2096,48 @@ def wrap_compute_layout_transform(topi_compute, schedule_rule="None"):
 
     return _compute_layout_transform
 
+
+def wrap_topi_mcu_add(topi_compute):
+    """Wrap TOPI compute which use conv2d attrs and output data type"""
+
+    def wrapper(attrs, inputs, out_type):
+        out_dtype = out_type.dtype
+        args = [*inputs, out_dtype]
+        return [topi_compute(*args)]
+
+    return wrapper
+
+
 @override_native_generic_func("mcu_add_strategy")
 def mcu_add_strategy(attrs, inputs, out_type, target):
     """qnn.add strategy for Hexagon"""
     strategy = _op.OpStrategy()
     strategy.add_implementation(
-        wrap_topi_compute(topi.hexagon.mcu_add),
+        wrap_topi_mcu_add(topi.hexagon.mcu_add),
         wrap_topi_schedule(topi.hexagon.schedule_mcu_add),
         name="mcu_add.generic",
     )
     return strategy
 
+
+def wrap_topi_mcu_truncate(topi_compute):
+    """Wrap TOPI compute which use conv2d attrs and output data type"""
+
+    def wrapper(attrs, inputs, out_type):
+        min = attrs.min
+        max = attrs.max
+        out_dtype = out_type.dtype
+        args = [*inputs, min, max, out_dtype]
+        return [topi_compute(*args)]
+
+    return wrapper
+
+
 @override_native_generic_func("mcu_truncate_strategy")
 def mcu_truncate_strategy(attrs, inputs, out_type, target):
     strategy = _op.OpStrategy()
     strategy.add_implementation(
-        wrap_topi_compute(topi.hexagon.mcu_truncate),
+        wrap_topi_mcu_truncate(topi.hexagon.mcu_truncate),
         wrap_topi_schedule(topi.hexagon.schedule_mcu_truncate),
         name="mcu_truncate.generic",
     )

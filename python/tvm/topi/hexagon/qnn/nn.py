@@ -1081,8 +1081,9 @@ def mcu_conv2d(  # Conv2d inputs
     ) """
 
     # Subtract zero point from input and then do padding with 0 value
-    data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x))
+    #data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x).astype(data.dtype))
 
+    data = subtract_zero_point(data, zero_x, "subtract_zero_point")
     # DOPAD
     if pad_top != 0 or pad_down != 0 or pad_left != 0 or pad_right != 0:
         pad_before = (0, 0, pad_top, pad_left)
@@ -1145,13 +1146,40 @@ def schedule_mcu_conv2d(outs):
     """
     return default_schedule(outs)
 
-def mcu_add(x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y):
+#def mcu_add(x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y, out_dtype=""):
     """Compute for qnn.add
     TODO: support 'axis' argument.
     """
-    return compute_qnn_binary_op(
-        x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y, topi.add
+#    return compute_qnn_binary_op(
+#        x1, x2, scale_x1, zero_x1, scale_x2, zero_x2, scale_y, zero_y, topi.add
+#    )
+    
+def mcu_add(x1, x2, zero_x1, zero_x2, scale_x1, scale_x2, zero_y, scale_y, out_dtype=""):
+    assert x1.dtype == x2.dtype
+    dtype = x1.dtype
+
+    def _compute_inputs(x: te.Tensor, iscale, input_zp):
+        out = te.compute(
+            x.shape,
+            lambda *i: te.round(
+                te.multiply(te.div(iscale, scale_y), te.subtract(x(*i), input_zp))
+            ).astype("int32")
+        )
+        return out
+    
+    x1_tensor = _compute_inputs(x1, scale_x1, zero_x1)
+    x2_tensor = _compute_inputs(x2, scale_x2, zero_x2)
+
+    out = te.compute(
+        x1.shape,
+        lambda *i: te.add(x1_tensor(*i), x2_tensor(*i)).astype("int32")
     )
+    #Add output zero point and clip+cast
+    out = te.compute(
+        out.shape,
+        lambda *i: saturate(te.add(out(*i), zero_y), dtype).astype(dtype)
+    )
+    return out
 
 def schedule_mcu_add(outs):
     """Schedule for qnn.add
@@ -1173,9 +1201,8 @@ def mcu_truncate(x1, min, max, out_dtype=""):
     """Compute for qnn.add
     TODO: support 'axis' argument.
     """
-    return saturate(
-        x1, out_dtype
-    )
+    out = te.compute(x1.shape, lambda *indices: saturate(x1(*indices), out_dtype)).astype(out_dtype)
+    return out
 
 def schedule_mcu_truncate(outs):
     """Schedule for qnn.add

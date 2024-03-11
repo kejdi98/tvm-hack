@@ -242,6 +242,7 @@ def test_no_zero_point():
         weight_dtype = "int8"
         bias_shape = (3,)
         bias_dtype = "int32"
+        zero_x = relay.const(5, "int32")
         effective_scales = [4, 3, 3]
         effective_scales = relay.const(np.array(effective_scales).astype("float32"))
         ref_func, qnn_func = get_funcs(
@@ -251,7 +252,7 @@ def test_no_zero_point():
             weight_dtype=weight_dtype,
             bias_shape=bias_shape,
             bias_dtype=bias_dtype,
-            zero_x=0,
+            zero_x=zero_x,
             zero_y=0,
             effective_scale=effective_scales,
             strides=(1, 1),

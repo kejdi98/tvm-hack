@@ -1082,8 +1082,7 @@ def mcu_conv2d(  # Conv2d inputs
 
     # Subtract zero point from input and then do padding with 0 value
     #data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x).astype(data.dtype))
-
-    data = subtract_zero_point(data, zero_x, "subtract_zero_point")
+    data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x(0)))
     # DOPAD
     if pad_top != 0 or pad_down != 0 or pad_left != 0 or pad_right != 0:
         pad_before = (0, 0, pad_top, pad_left)
@@ -1123,7 +1122,7 @@ def mcu_conv2d(  # Conv2d inputs
         axis = -1
         if len(effective_scale.shape) == 1:
             axis = 1  # Axis param should correspond to 'C' dimension.
-            out = te.compute(out.shape, lambda n, c, h, w: saturate(te.add(te.round(effective_scale[c] * out[n, c, h, w]), zero_y), out_dtype).astype(out_dtype))
+            out = te.compute(out.shape, lambda n, c, h, w: saturate(te.add(te.round(effective_scale[c] * out[n, c, h, w]), zero_y(0)), out_dtype).astype(out_dtype))
             return out
         else:
             out = te.compute(out.shape, lambda *indices: saturate(te.add(te.round(effective_scale * out(*indices)), zero_y), out_dtype).astype(out_dtype))
@@ -1162,7 +1161,7 @@ def mcu_add(x1, x2, zero_x1, zero_x2, scale_x1, scale_x2, zero_y, scale_y, out_d
         out = te.compute(
             x.shape,
             lambda *i: te.round(
-                te.multiply(te.div(iscale, scale_y), te.subtract(x(*i), input_zp))
+                te.multiply(te.div(iscale(0), scale_y(0)), te.subtract(x(*i), input_zp(0)))
             ).astype("int32")
         )
         return out
@@ -1177,7 +1176,7 @@ def mcu_add(x1, x2, zero_x1, zero_x2, scale_x1, scale_x2, zero_y, scale_y, out_d
     #Add output zero point and clip+cast
     out = te.compute(
         out.shape,
-        lambda *i: saturate(te.add(out(*i), zero_y), dtype).astype(dtype)
+        lambda *i: saturate(te.add(out(*i), zero_y(0)), dtype).astype(dtype)
     )
     return out
 

@@ -2164,10 +2164,27 @@ def wrap_topi_mcu_conv2d(topi_compute):
 
 @override_native_generic_func("mcu_conv2d_strategy")
 def mcu_conv2d_strategy(attrs, inputs, out_type, target):
+
+    data = inputs[0]
+    kernel = inputs[1]
+    data_layout = attrs.data_layout
+    kernel_layout = attrs.kernel_layout
+    groups = attrs.groups
     strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_topi_mcu_conv2d(topi.hexagon.mcu_conv2d),
-        wrap_topi_schedule(topi.hexagon.schedule_mcu_conv2d),
-        name="mcu_conv2d.generic",
-    )
+    if groups == 1:
+        if data_layout == "NCHW" and kernel_layout == "OIHW":
+            strategy.add_implementation(
+                wrap_topi_mcu_conv2d(topi.hexagon.mcu_conv2d),
+                wrap_topi_schedule(topi.hexagon.schedule_mcu_conv2d),
+                name="mcu_conv2d.generic",
+            )
+    elif is_depthwise_conv2d(data.shape, data_layout, kernel.shape, kernel_layout, groups):
+        if data_layout == "NCHW" and kernel_layout == "OIHW":
+            strategy.add_implementation(
+                wrap_topi_mcu_conv2d(topi.hexagon.mcu_depthwise_conv2d),
+                wrap_topi_schedule(topi.hexagon.schedule_mcu_depthwise_conv2d),
+                name="mcu_depthwise_conv2d.generic",
+            )
+    else:
+        raise RuntimeError("Unsupported strategy for group qnn.conv2d")
     return strategy

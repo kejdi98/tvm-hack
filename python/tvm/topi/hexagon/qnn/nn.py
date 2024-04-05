@@ -1218,3 +1218,106 @@ def schedule_mcu_truncate(outs):
         The computation schedule for the op.
     """
     return default_schedule(outs)
+
+def mcu_depthwise_conv2d(  # Conv2d inputs
+    data,
+    weight,
+    bias,
+    # Conv2d quantization params:
+    zero_x,
+    zero_y,
+    effective_scale,
+    strides,
+    padding,
+    dilation,
+    groups,
+    channels,
+    kernel_size,
+    data_layout,
+    kernel_layout,
+    out_layout,
+    out_dtype,
+):
+    """Compute for qnn.conv2d with NCHW layout
+
+    Output data type should be specified through the 'odtype' parameter. qdepthwise nn.conv2d
+    leverages int32 type to store intermediate results. If 'odtype' differs from int32, you need to
+    specify requantization parameters.
+    """
+    kernel_height = weight.shape[2]  # OIHW layout
+    kernel_width = weight.shape[3]  # OIHW layout
+
+    height_stride, width_stride = strides
+    dilation_h, dilation_w = dilation
+
+    dilated_kernel_h = (kernel_height - 1) * dilation_h + 1
+    dilated_kernel_w = (kernel_width - 1) * dilation_w + 1
+
+    pad_top, pad_left, pad_down, pad_right = get_pad_tuple(
+        get_const_tuple(padding), (dilated_kernel_h, dilated_kernel_w)
+    )
+
+    # Subtract zero point from input and then do padding with 0 value
+    data = te.compute(data.shape, lambda *indices: te.subtract(data(*indices), zero_x(0)))
+
+    # DOPAD
+    if pad_top != 0 or pad_down != 0 or pad_left != 0 or pad_right != 0:
+        pad_before = (0, 0, pad_top, pad_left)
+        pad_after = (0, 0, pad_down, pad_right)
+        data_pad = pad(data, pad_before, pad_after, name="data_pad")
+    else:
+        data_pad = data
+
+    kh = te.reduce_axis((0, kernel_height), name="kh")
+    kw = te.reduce_axis((0, kernel_width), name="kw")
+
+    output_height = ((data.shape[2] + pad_top + pad_down - dilated_kernel_h) // height_stride) + 1
+    output_width = ((data.shape[3] + pad_left + pad_right - dilated_kernel_w) // width_stride) + 1
+    output_channels = weight.shape[0]
+    batch_size = data.shape[0]
+    output_shape = (batch_size, output_channels, output_height, output_width)
+
+    out = te.compute(
+        output_shape,
+        lambda n, oc, oh, ow: te.sum(
+            data_pad[
+                n, oc, oh * height_stride + kh * dilation_h, ow * width_stride + kw * dilation_w
+            ].astype("int32")
+            * weight[oc, 0, kh, kw].astype("int32"),
+            axis=[kh, kw],
+        ),
+    )
+
+    # Add bias
+    if bias is not None:
+        assert len(bias.shape) == 1
+        out = te.compute(out.shape, lambda n, c, h, w: out[n, c, h, w].astype("int32") + bias[c].astype("int32"))
+    
+    if effective_scale is not None:
+        # Now supported only scalar and 1D quantization parameters
+        assert len(effective_scale.shape) == 0 or len(effective_scale.shape) == 1
+        axis = -1
+        if len(effective_scale.shape) == 1:
+            axis = 1  # Axis param should correspond to 'C' dimension.
+            out = te.compute(out.shape, lambda n, c, h, w: saturate(te.add(te.round(effective_scale[c] * out[n, c, h, w]), zero_y(0)), out_dtype).astype(out_dtype))
+            return out
+        else:
+            out = te.compute(out.shape, lambda *indices: saturate(te.add(te.round(effective_scale * out(*indices)), zero_y), out_dtype).astype(out_dtype))
+    return out
+
+
+def schedule_mcu_depthwise_conv2d(outs):
+    """Schedule for qnn.conv2d
+
+    Parameters
+    ----------
+    outs: Array of Tensor
+          The computation graph description of qnn.conv2d
+          in the format of an array of tensors.
+
+    Returns
+    -------
+    sch: Schedule
+        The computation schedule for the op.
+    """
+    return default_schedule(outs)

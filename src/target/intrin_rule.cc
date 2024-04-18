@@ -82,6 +82,9 @@ TVM_REGISTER_OP("tir.sin").set_attr<FLowerIntrinsic>("default.FLowerIntrinsic",
 TVM_REGISTER_OP("tir.asin")
     .set_attr<FLowerIntrinsic>("default.FLowerIntrinsic", DispatchPureExtern<FloatSuffix>);
 
+TVM_REGISTER_OP("tir.fabs")
+    .set_attr<FLowerIntrinsic>("default.FLowerIntrinsic", DispatchPureExtern<FloatSuffix>);
+
 TVM_REGISTER_OP("tir.sinh")
     .set_attr<FLowerIntrinsic>("default.FLowerIntrinsic", DispatchPureExtern<FloatSuffix>);
 
